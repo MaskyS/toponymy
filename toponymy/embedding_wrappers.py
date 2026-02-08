@@ -1,10 +1,13 @@
+from __future__ import annotations
+
+import os
+import warnings
+from typing import List, Optional, Protocol, Sequence
+
 import numpy as np
 from tqdm.auto import tqdm
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
 
-
-from typing import Optional, List, Protocol, Sequence
+from toponymy._ai_sdk_bridge import call_ai_sdk_bridge
 from toponymy._utils import handle_verbose_params
 
 
@@ -20,317 +23,140 @@ class TextEmbedderProtocol(Protocol):
     ) -> np.typing.NDArray[np.floating]: ...
 
 
-# Cohere
-try:
-    import cohere
+class _AISDKEmbedder:
+    def __init__(self, provider: str, model: str, **provider_config):
+        self.provider = provider
+        self.model = model
+        self.provider_config = provider_config
 
-    class CohereEmbedder:
-        def __init__(
-            self,
-            api_key,
-            model: str = "embed-multilingual-v3.0",
-            base_url: str = None,
-            httpx_client: Optional[httpx.Client] = None,
-        ):
-            self.co = cohere.ClientV2(api_key=api_key)
-            self.model = model
-            self.base_url = base_url
-            self.httpx_client = httpx_client
-            self.input_type = "search_query"  # We will be embedding keyphrases and subtopic names to match against documents
-            self.embedding_types = ["float"]
+    def _encode_batch(self, texts: List[str]) -> np.ndarray:
+        payload = {
+            "action": "embed_many",
+            "provider": self.provider,
+            "model": self.model,
+            "texts": texts,
+            **self.provider_config,
+        }
+        result = call_ai_sdk_bridge(payload)
+        embeddings = result.get("embeddings", [])
+        return np.asarray(embeddings, dtype=np.float32)
 
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
-            )
-
-            result = []
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                response = self.co.embed(
-                    texts=texts[i : i + 96],
-                    model=self.model,
-                    input_type=self.input_type,
-                    embedding_types=self.embedding_types,
-                )
-                result.append(np.asarray(response.embeddings.float_))
-
-            return np.vstack(result)
-
-except ImportError:
-    pass
-
-# OpenAI
-try:
-    import openai
-
-    class OpenAIEmbedder:
-
-        def __init__(
-            self,
-            api_key,
-            model: str = "text-embedding-3-small",
-            base_url: str = None,
-            http_client: Optional[httpx.Client] = None,
-        ):
-            self.api_key = api_key
-            self.model = model
-            self.base_url = base_url
-            self.http_client = http_client
-
-            self.client = openai.OpenAI(
-                api_key=api_key, base_url=base_url, http_client=http_client
-            )
-
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
-            )
-
-            result = []
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                response = self.client.embeddings.create(
-                    input=texts[i : i + 96], model=self.model, encoding_format="float"
-                )
-                result.append(np.asarray([item.embedding for item in response.data]))
-
-            return np.vstack(result)
-
-except ImportError:
-    pass
-
-# Anthropic
-try:
-    import anthropic
-
-    class AnthropicEmbedder:
-        def __init__(
-            self,
-            api_key,
-            model: str = "claude-3-haiku-20240307",
-            base_url: str = None,
-            httpx_client: Optional[httpx.Client] = None,
-        ):
-            self.client = anthropic.Anthropic(api_key=api_key)
-            self.model = model
-            self.base_url = base_url
-            self.httpx_client = httpx_client
-
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
-            )
-
-            result = []
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                batch = texts[i : i + 96]
-                # Anthropic embeddings are done one at a time in the current API
-                batch_embeddings = []
-                for text in tqdm(
-                    batch,
-                    desc="embedding batch",
-                    disable=(not show_progress_bar),
-                    leave=False,
-                ):
-                    response = self.client.embeddings.create(
-                        model=self.model,
-                        input=text,
-                    )
-                    batch_embeddings.append(response.embedding)
-                result.append(np.array(batch_embeddings))
-
-            return np.vstack(result)
-
-except ImportError:
-    pass
-
-# Microsoft Azure
-try:
-    import azure.ai.inference
-    from azure.core.credentials import AzureKeyCredential
-
-    class AzureAIEmbedder:
-        def __init__(self, api_key: str, endpoint: str, model: str):
-            self.credentials = AzureKeyCredential(api_key)
-            self.client = azure.ai.inference.EmbeddingsClient(
-                endpoint=endpoint, credential=self.credentials
-            )
-            self.model = model
-
-        @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=4, max=10),
+    def encode(
+        self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
+    ) -> np.ndarray:
+        show_progress_bar_val, _ = handle_verbose_params(
+            verbose=verbose,
+            show_progress_bar=show_progress_bar,
+            default_verbose=False,
         )
-        def _encode_batch(self, texts: list) -> np.ndarray:
-            # Call the Azure AI Inference API
-            response = self.client.embed(
-                model=self.model,
-                input=[str(x) if len(x) > 0 else "[NO_TEXT]" for x in texts],
+
+        if len(texts) == 0:
+            return np.empty((0, 0), dtype=np.float32)
+
+        result = []
+        for i in tqdm(
+            range(0, len(texts), 96),
+            desc="embedding texts",
+            disable=(not show_progress_bar_val),
+        ):
+            result.append(self._encode_batch(texts[i : i + 96]))
+
+        return np.vstack(result)
+
+
+class CohereEmbedder(_AISDKEmbedder):
+    def __init__(
+        self,
+        api_key,
+        model: str = "embed-multilingual-v3.0",
+        base_url: str = None,
+        httpx_client=None,
+    ):
+        api_key = api_key or os.environ.get("CO_API_KEY") or os.environ.get("COHERE_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Cohere API key is required. Set `CO_API_KEY` or `COHERE_API_KEY`, or pass `api_key`."
             )
-            # Extract embeddings from the response
-            embeddings = [item.embedding for item in response.data]
-            if len(embeddings) != len(texts):
-                print(
-                    f"Warning: Expected {len(texts)} embeddings, but got {len(embeddings)}."
-                )
-                print(f"Texts: {texts}")
-            assert len(embeddings) == len(texts)
-            return np.array(embeddings)
-
-        def encode(
-            self, texts: list, verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
+        if base_url is None:
+            base_url = os.environ.get("CO_API_URL")
+        if httpx_client is not None:
+            warnings.warn(
+                "`httpx_client` is ignored by CohereEmbedder in AI SDK mode.",
+                stacklevel=2,
             )
+        self.input_type = "search_query"
+        self.embedding_types = ["float"]
+        super().__init__(
+            provider="cohere",
+            model=model,
+            apiKey=api_key,
+            baseURL=base_url,
+            providerOptions={
+                "cohere": {
+                    "inputType": self.input_type,
+                }
+            },
+        )
 
-            result = []
 
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                embeddings = self._encode_batch(texts[i : i + 96])
-                result.append(embeddings)
-
-            return np.vstack(result)
-
-except ImportError as e:
-    pass
-
-# Mistral
-try:
-    import mistralai.client
-
-    class MistralEmbedder:
-        def __init__(self, api_key: str, model: str = "mistral-embed"):
-            self.client = mistralai.client.MistralClient(api_key=api_key)
-            self.model = model
-
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
+class OpenAIEmbedder(_AISDKEmbedder):
+    def __init__(
+        self,
+        api_key,
+        model: str = "text-embedding-3-small",
+        base_url: str = None,
+        http_client=None,
+    ):
+        if http_client is not None:
+            warnings.warn(
+                "`http_client` is ignored by OpenAIEmbedder in AI SDK mode.",
+                stacklevel=2,
             )
+        super().__init__(
+            provider="openai",
+            model=model,
+            apiKey=api_key,
+            baseURL=base_url,
+        )
 
-            result = []
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                response = self.client.embeddings(
-                    model=self.model, inputs=texts[i : i + 96]
-                )
-                result.append(np.array([item.embedding for item in response.data]))
 
-            return np.vstack(result)
+class AzureAIEmbedder(_AISDKEmbedder):
+    def __init__(self, api_key: str, endpoint: str, model: str):
+        super().__init__(
+            provider="azure_inference",
+            model=model,
+            apiKey=api_key,
+            endpoint=endpoint,
+        )
 
-except ImportError:
-    pass
 
-# Voyage AI
-try:
-    import requests
+class MistralEmbedder(_AISDKEmbedder):
+    def __init__(self, api_key: str, model: str = "mistral-embed"):
+        super().__init__(
+            provider="mistral",
+            model=model,
+            apiKey=api_key,
+        )
 
-    class VoyageAIEmbedder:
-        def __init__(self, api_key: str, model: str = "voyage-2"):
-            self.api_key = api_key
-            self.model = model
-            self.base_url = "https://api.voyageai.com/v1/embeddings"
-            self.headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
 
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
-            )
+class VoyageAIEmbedder(_AISDKEmbedder):
+    def __init__(self, api_key: str, model: str = "voyage-2"):
+        super().__init__(
+            provider="voyage",
+            model=model,
+            apiKey=api_key,
+            baseURL="https://api.voyageai.com/v1",
+        )
 
-            result = []
-            for i in tqdm(
-                range(0, len(texts), 96),
-                desc="embedding texts",
-                disable=(not show_progress_bar_val),
-            ):
-                response = requests.post(
-                    self.base_url,
-                    headers=self.headers,
-                    json={
-                        "model": self.model,
-                        "input": texts[i : i + 96],
-                        "encoding_format": "float",
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                result.append(np.array([item["embedding"] for item in data["data"]]))
 
-            return np.vstack(result)
-
-except ImportError:
-    pass
-
-try:
-    import vllm
-
-    class VLLMEmbedder:
-        def __init__(self, model: str = "all-MiniLM-L6-v2", kwargs: dict = {}):
-            self.llm = vllm.LLM(model=model, task="embed", **kwargs)
-
-        def encode(
-            self, texts: List[str], verbose: bool = None, show_progress_bar: bool = None
-        ) -> np.ndarray:
-            # Handle verbose parameters
-            show_progress_bar_val, _ = handle_verbose_params(
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                default_verbose=False,
-            )
-
-            outputs = self.llm.embed(texts, use_tqdm=show_progress_bar_val)
-            embeddings = np.vstack([o.outputs.embedding for o in outputs])
-            return embeddings
-
-except ImportError:
-    pass
+class VLLMEmbedder(_AISDKEmbedder):
+    def __init__(self, model: str = "all-MiniLM-L6-v2", kwargs: dict = {}):
+        base_url = kwargs.get("base_url", "http://localhost:8000/v1")
+        api_key = kwargs.get("api_key", "EMPTY")
+        super().__init__(
+            provider="openai_compatible",
+            model=model,
+            name="vllm",
+            baseURL=base_url,
+            apiKey=api_key,
+        )
