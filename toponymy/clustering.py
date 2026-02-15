@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import numpy as np
 import numba
+
 from fast_hdbscan.cluster_trees import (
     mst_to_linkage_tree,
     condense_tree,

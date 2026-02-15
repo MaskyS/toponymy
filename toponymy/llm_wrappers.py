@@ -6,7 +6,7 @@ import transformers
 
 from toponymy.templates import GET_TOPIC_CLUSTER_NAMES_REGEX, GET_TOPIC_NAME_REGEX
 from abc import ABC, abstractmethod
-from typing import List, Optional, Union, Dict
+from typing import Any, List, Optional, Union, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 import re
@@ -76,6 +76,15 @@ def llm_output_to_result(llm_output: str, regex: str) -> dict:
     return result
 
 
+def coerce_topic_specificity(value: Any, default: float = 0.0) -> float:
+    """Parse and clamp topic specificity to a float in [0.0, 1.0]."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(1.0, parsed))
+
+
 class LLMWrapper(ABC):
 
     @abstractmethod
@@ -132,6 +141,50 @@ class LLMWrapper(ABC):
                 f"Failed to generate topic name with {self.__class__.__name__}"
             )
         return topic_name
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry_error_callback=lambda x: ("", 0.0),
+        retry=retry_if_exception(_should_retry),
+    )
+    def generate_topic_name_with_specificity(
+        self, prompt: Union[str, Dict[str, str]], temperature: float = 0.4
+    ) -> tuple:
+        """
+        Generate a topic name and its specificity level.
+        Returns a tuple of (topic_name, topic_specificity_float).
+        """
+        try:
+            if isinstance(prompt, str):
+                topic_name_info_raw = self._call_llm(
+                    prompt, temperature, max_tokens=128
+                )
+            elif isinstance(prompt, dict) and self.supports_system_prompts:
+                topic_name_info_raw = self._call_llm_with_system_prompt(
+                    system_prompt=prompt["system"],
+                    user_prompt=prompt["user"],
+                    temperature=temperature,
+                    max_tokens=128,
+                )
+            else:
+                raise InvalidLLMInputError(
+                    f"Prompt must be a string or a dictionary, got {type(prompt)}"
+                )
+
+            topic_name_info = llm_output_to_result(
+                topic_name_info_raw, GET_TOPIC_NAME_REGEX
+            )
+            topic_name = str(topic_name_info["topic_name"])
+            topic_specificity = coerce_topic_specificity(
+                topic_name_info.get("topic_specificity", 0.0),
+                default=0.0,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to generate topic name with specificity with {self.__class__.__name__}"
+            )
+        return (topic_name, topic_specificity)
 
     # @abstractmethod
     @retry(
@@ -294,6 +347,54 @@ class AsyncLLMWrapper(ABC):
                     f"Failed to generate topic name with {self.__class__.__name__}: {e}"
                 )
                 results.append("")  # Fallback to empty string if parsing fails
+
+        return results
+
+    async def generate_topic_names_with_specificity(
+        self, prompts: List[Union[str, Dict[str, str]]], temperature: float = 0.4
+    ) -> List[tuple]:
+        """
+        Generate topic names and specificity levels for a batch of prompts.
+        Returns a list of (topic_name, topic_specificity) tuples matching the input prompts.
+        """
+        if not prompts:
+            return []
+
+        # Check the first prompt to determine type
+        if isinstance(prompts[0], str):
+            responses = await self._call_llm_batch(prompts, temperature, max_tokens=128)
+        elif isinstance(prompts[0], dict) and self.supports_system_prompts:
+            system_prompts = [p["system"] for p in prompts]
+            user_prompts = [p["user"] for p in prompts]
+            responses = await self._call_llm_with_system_prompt_batch(
+                system_prompts, user_prompts, temperature, max_tokens=128
+            )
+        else:
+            raise InvalidLLMInputError(
+                f"Prompts must be strings or dictionaries, got {type(prompts[0])}"
+            )
+
+        # Parse responses
+        results = []
+        for response in responses:
+            if not response:
+                results.append(("", 0.0))
+                continue
+
+            # Attempt to parse the response
+            try:
+                topic_name_info = llm_output_to_result(response, GET_TOPIC_NAME_REGEX)
+                topic_name = str(topic_name_info["topic_name"])
+                topic_specificity = coerce_topic_specificity(
+                    topic_name_info.get("topic_specificity", 0.0),
+                    default=0.0,
+                )
+                results.append((topic_name, topic_specificity))
+            except Exception as e:
+                warn(
+                    f"Failed to generate topic name with specificity with {self.__class__.__name__}: {e}"
+                )
+                results.append(("", 0.0))  # Fallback if parsing fails
 
         return results
 
@@ -632,6 +733,7 @@ try:
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
             self.max_concurrent_requests = max_concurrent_requests
+            self.semaphore = asyncio.Semaphore(max_concurrent_requests)
 
         async def _call_llm_batch(
             self, prompts: List[str], temperature: float, max_tokens: int
@@ -793,6 +895,7 @@ try:
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
             self.max_concurrent_requests = max_concurrent_requests
+            self.semaphore = asyncio.Semaphore(max_concurrent_requests)
 
         def _start_engine(self):
             self.llm = vllm.LLM(model=self.model, **self.kwargs)
@@ -2075,16 +2178,36 @@ try:
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
 
+        def _is_gpt5_model(self) -> bool:
+            """Check if the model is a GPT-5 family model."""
+            return self.model.startswith("gpt-5")
+
         def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
-            response = self.llm.chat.completions.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt + self.extra_prompting}],
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-            result = response.choices[0].message.content
-            return result
+            if self._is_gpt5_model():
+                # GPT-5 models use the new Responses API
+                # Note: temperature not supported with reasoning models
+                # The Responses API requires "json" in input when using json_object format
+                input_text = prompt + self.extra_prompting
+                if "json" not in input_text.lower():
+                    input_text += "\n\nRespond with JSON."
+                response = self.llm.responses.create(
+                    model=self.model,
+                    input=input_text,
+                    reasoning={"effort": "minimal"},
+                    max_output_tokens=max_tokens,
+                    text={"format": {"type": "json_object"}},
+                )
+                return response.output_text
+            else:
+                # GPT-4 and older models use Chat Completions API
+                response = self.llm.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt + self.extra_prompting}],
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
 
         def _call_llm_with_system_prompt(
             self,
@@ -2093,18 +2216,35 @@ try:
             temperature: float,
             max_tokens: int,
         ) -> str:
-            response = self.llm.chat.completions.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt + self.extra_prompting},
-                ],
-                temperature=temperature,
-                response_format={"type": "json_object"},
-            )
-            result = response.choices[0].message.content
-            return result
+            if self._is_gpt5_model():
+                # GPT-5 models use the new Responses API with instructions parameter
+                # Note: temperature not supported with reasoning models
+                # The Responses API requires "json" in input when using json_object format
+                input_text = user_prompt + self.extra_prompting
+                if "json" not in input_text.lower():
+                    input_text += "\n\nRespond with JSON."
+                response = self.llm.responses.create(
+                    model=self.model,
+                    instructions=system_prompt,
+                    input=input_text,
+                    reasoning={"effort": "minimal"},
+                    max_output_tokens=max_tokens,
+                    text={"format": {"type": "json_object"}},
+                )
+                return response.output_text
+            else:
+                # GPT-4 and older models use Chat Completions API
+                response = self.llm.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt + self.extra_prompting},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return response.choices[0].message.content
 
     class AsyncOpenAINamer(AsyncLLMWrapper):
         """
@@ -2174,12 +2314,18 @@ try:
                     "OpenAI API key is required. Set it as an environment variable OPENAI_API_KEY or pass it directly to the constructor."
                 )
 
-            self.client = openai.AsyncOpenAI(api_key=api_key, organization=organization)
+            self.client = openai.AsyncOpenAI(
+                api_key=api_key, organization=organization, base_url=base_url
+            )
             self.model = model
             self.extra_prompting = (
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
             self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+
+        def _is_gpt5_model(self) -> bool:
+            """Check if the model is a GPT-5 family model."""
+            return self.model.startswith("gpt-5")
 
         async def _call_single_llm(
             self, prompt: str, temperature: float, max_tokens: int
@@ -2187,16 +2333,32 @@ try:
             """Call the LLM for a single prompt."""
             try:
                 async with self.semaphore:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "user", "content": prompt + self.extra_prompting}
-                        ],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        response_format={"type": "json_object"},
-                    )
-                    return response.choices[0].message.content
+                    if self._is_gpt5_model():
+                        input_text = prompt + self.extra_prompting
+                        if "json" not in input_text.lower():
+                            input_text += "\n\nRespond with JSON."
+                        response = await self.client.responses.create(
+                            model=self.model,
+                            input=input_text,
+                            reasoning={"effort": "minimal"},
+                            max_output_tokens=max_tokens,
+                            text={"format": {"type": "json_object"}},
+                        )
+                        return response.output_text
+                    else:
+                        response = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": prompt + self.extra_prompting,
+                                }
+                            ],
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            response_format={"type": "json_object"},
+                        )
+                        return response.choices[0].message.content
             except Exception as e:
                 warn(f"OpenAI API call failed: {str(e)[:100]}...")
                 return ""
@@ -2211,20 +2373,34 @@ try:
             """Call the LLM for a single prompt with system prompt."""
             try:
                 async with self.semaphore:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {
-                                "role": "user",
-                                "content": user_prompt + self.extra_prompting,
-                            },
-                        ],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        response_format={"type": "json_object"},
-                    )
-                    return response.choices[0].message.content
+                    if self._is_gpt5_model():
+                        input_text = user_prompt + self.extra_prompting
+                        if "json" not in input_text.lower():
+                            input_text += "\n\nRespond with JSON."
+                        response = await self.client.responses.create(
+                            model=self.model,
+                            instructions=system_prompt,
+                            input=input_text,
+                            reasoning={"effort": "minimal"},
+                            max_output_tokens=max_tokens,
+                            text={"format": {"type": "json_object"}},
+                        )
+                        return response.output_text
+                    else:
+                        response = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {
+                                    "role": "user",
+                                    "content": user_prompt + self.extra_prompting,
+                                },
+                            ],
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            response_format={"type": "json_object"},
+                        )
+                        return response.choices[0].message.content
             except Exception as e:
                 warn(f"OpenAI API call failed: {str(e)[:100]}...")
                 return ""
@@ -3358,13 +3534,44 @@ except ImportError:
 
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
+
+    # JSON schemas for structured outputs (Gemini 3 native JSON mode)
+    GEMINI_TOPIC_NAME_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "topic_name": {"type": "string", "description": "The topic name for this cluster (2-5 words)"},
+            "topic_specificity": {"type": "number", "description": "A score between 0.0 and 1.0 indicating specificity"}
+        },
+        "required": ["topic_name", "topic_specificity"]
+    }
+
+    GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "new_topic_name_mapping": {
+                "type": "object",
+                "description": "Mapping of old topic names to new topic names",
+                "additionalProperties": {"type": "string"}
+            },
+            "topic_specificities": {
+                "type": "object",
+                "description": "Mapping of topic names to specificity scores",
+                "additionalProperties": {"type": "number"}
+            }
+        },
+        "required": ["new_topic_name_mapping", "topic_specificities"]
+    }
 
     class GoogleGeminiNamer(LLMWrapper):
         """
         Provides access to Google's Gemini LLMs with the Toponymy framework. For more information on Google Gemini, see
-        https://developers.google.com/generative-ai. You will need a Google API key to use this wrapper.
-        The default model is "gemini-1.5-flash", which provides a good balance of performance and cost.
+        https://ai.google.dev/gemini-api. You will need a Google API key to use this wrapper.
+        The default model is "gemini-3-flash-preview", which provides a good balance of performance and cost.
+
+        For Gemini 3 models (gemini-3-pro-preview, gemini-3-flash-preview), the API uses dynamic thinking
+        by default and temperature is recommended to stay at 1.0.
 
         Parameters:
         -----------
@@ -3372,16 +3579,22 @@ try:
             Your Google API key. You can set this as an environment variable GOOGLE_API_KEY or pass it directly.
 
         model: str, optional
-            The name of the Gemini model to use. Default is "gemini-1.5-flash". Available models include
-            "gemini-1.5-pro", "gemini-1.5-flash", etc.
+            The name of the Gemini model to use. Default is "gemini-2.0-flash". Available models include:
+            - "gemini-3-flash-preview" (recommended - Pro-level intelligence at Flash speed)
+            - "gemini-3-pro-preview" (most capable, complex reasoning)
+            - "gemini-2.0-flash" (legacy, still available)
 
         llm_specific_instructions: str, optional
             Additional instructions specific to the LLM, appended to the prompt.
 
+        thinking_level: str, optional
+            For Gemini 3 models only. Controls reasoning depth: "low", "medium" (Flash only),
+            "high" (default). Higher levels improve reasoning but increase latency.
+
         Attributes:
         -----------
-        model: genai.GenerativeModel
-            The Gemini model instance.
+        client: genai.Client
+            The Gemini API client instance.
 
         model_name: str
             The name of the Gemini model being used.
@@ -3395,9 +3608,11 @@ try:
 
         def __init__(
             self,
-            api_key: str,
-            model: str = "gemini-1.5-flash",
-            llm_specific_instructions=None,
+            api_key: str = None,
+            model: str = "gemini-3-flash-preview",
+            llm_specific_instructions: str = None,
+            thinking_level: str = None,
+            debug: bool = False,
         ):
             api_key = api_key or os.getenv("GOOGLE_API_KEY")
             if not api_key:
@@ -3405,22 +3620,55 @@ try:
                     "Google API key is required. Set it as an environment variable GOOGLE_API_KEY or pass it directly to the constructor."
                 )
 
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(model)
+            self.client = genai.Client(api_key=api_key)
             self.model_name = model
             self.extra_prompting = (
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
+            self.thinking_level = thinking_level
+            self.debug = debug
 
-        def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
-            generation_config = genai.types.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
+        def _call_llm(self, prompt: str, temperature: float, max_tokens: int, json_schema: dict = None) -> str:
+            """Call LLM with structured JSON output for topic naming."""
+            # Detect schema based on max_tokens heuristic:
+            # - 128 tokens = single topic name (GEMINI_TOPIC_NAME_SCHEMA)
+            # - 1024 tokens = cluster names disambiguation (GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA)
+            is_disambiguation = max_tokens > 256
+            if json_schema is None:
+                json_schema = GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA if is_disambiguation else GEMINI_TOPIC_NAME_SCHEMA
+
+            # For disambiguation calls with thinking enabled, increase token limit
+            # because thinking tokens consume part of the output budget
+            effective_max_tokens = max(max_tokens * 3, 2048) if is_disambiguation else max_tokens
+
+            config_kwargs = {
+                "temperature": temperature,
+                "max_output_tokens": effective_max_tokens,
+                # Use structured JSON output for reliable parsing
+                "response_mime_type": "application/json",
+                "response_json_schema": json_schema,
+            }
+
+            # Add thinking config for Gemini 3 models - use "low" for faster responses
+            if "gemini-3" in self.model_name:
+                config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                    thinking_level=self.thinking_level or "low"
+                )
+
+            if self.debug:
+                print(f"[DEBUG GoogleGeminiNamer] Calling {self.model_name}")
+                print(f"[DEBUG GoogleGeminiNamer] Schema: {'cluster_names' if max_tokens > 256 else 'topic_name'}")
+                print(f"[DEBUG GoogleGeminiNamer] Prompt (first 500 chars): {prompt[:500]}...")
+
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt + self.extra_prompting,
+                config=genai_types.GenerateContentConfig(**config_kwargs),
             )
 
-            response = self.model.generate_content(
-                prompt + self.extra_prompting, generation_config=generation_config
-            )
+            if self.debug:
+                print(f"[DEBUG GoogleGeminiNamer] Raw response: {response.text}")
+
             return response.text
 
         def _call_llm_with_system_prompt(
@@ -3429,27 +3677,55 @@ try:
             user_prompt: str,
             temperature: float,
             max_tokens: int,
+            json_schema: dict = None,
         ) -> str:
-            generation_config = genai.types.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
+            """Call LLM with system prompt and structured JSON output."""
+            # Detect schema based on max_tokens heuristic
+            is_disambiguation = max_tokens > 256
+            if json_schema is None:
+                json_schema = GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA if is_disambiguation else GEMINI_TOPIC_NAME_SCHEMA
+
+            # For disambiguation calls with thinking enabled, increase token limit
+            # because thinking tokens consume part of the output budget
+            effective_max_tokens = max(max_tokens * 3, 2048) if is_disambiguation else max_tokens
+
+            config_kwargs = {
+                "temperature": temperature,
+                "max_output_tokens": effective_max_tokens,
+                "system_instruction": system_prompt,
+                # Use structured JSON output for reliable parsing
+                "response_mime_type": "application/json",
+                "response_json_schema": json_schema,
+            }
+
+            # Add thinking config for Gemini 3 models
+            if "gemini-3" in self.model_name:
+                config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                    thinking_level=self.thinking_level or "low"
+                )
+
+            if self.debug:
+                print(f"[DEBUG GoogleGeminiNamer] Calling {self.model_name} with system prompt")
+                print(f"[DEBUG GoogleGeminiNamer] Schema: {'cluster_names' if max_tokens > 256 else 'topic_name'}")
+                print(f"[DEBUG GoogleGeminiNamer] System (first 200 chars): {system_prompt[:200]}...")
+                print(f"[DEBUG GoogleGeminiNamer] User (first 300 chars): {user_prompt[:300]}...")
+
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=user_prompt + self.extra_prompting,
+                config=genai_types.GenerateContentConfig(**config_kwargs),
             )
 
-            # Gemini doesn't have explicit system prompts, so we combine them
-            combined_prompt = (
-                f"System: {system_prompt}\n\nUser: {user_prompt + self.extra_prompting}"
-            )
+            if self.debug:
+                print(f"[DEBUG GoogleGeminiNamer] Raw response: {response.text}")
 
-            response = self.model.generate_content(
-                combined_prompt, generation_config=generation_config
-            )
             return response.text
 
     class AsyncGoogleGeminiNamer(AsyncLLMWrapper):
         """
         Provides access to Google's Gemini LLMs with asynchronous support. This allows for concurrent processing of multiple prompts.
-        For more information on Google Gemini, see https://developers.google.com/generative-ai. You will need a Google API key to use this wrapper.
-        The default model is "gemini-1.5-flash", which provides a good balance of performance and cost.
+        For more information on Google Gemini, see https://ai.google.dev/gemini-api. You will need a Google API key to use this wrapper.
+        The default model is "gemini-3-flash-preview", which provides a good balance of performance and cost.
 
         Parameters:
         -----------
@@ -3457,8 +3733,10 @@ try:
             Your Google API key. You can set this as an environment variable GOOGLE_API_KEY or pass it directly.
 
         model: str, optional
-            The name of the Gemini model to use. Default is "gemini-1.5-flash". Available models include
-            "gemini-1.5-pro", "gemini-1.5-flash", etc.
+            The name of the Gemini model to use. Default is "gemini-2.0-flash". Available models include:
+            - "gemini-3-flash-preview" (recommended - Pro-level intelligence at Flash speed)
+            - "gemini-3-pro-preview" (most capable, complex reasoning)
+            - "gemini-2.0-flash" (legacy, still available)
 
         llm_specific_instructions: str, optional
             Additional instructions specific to the LLM, appended to the prompt.
@@ -3466,10 +3744,14 @@ try:
         max_concurrent_requests: int, optional
             The maximum number of concurrent requests to the Gemini API. Default is 10.
 
+        thinking_level: str, optional
+            For Gemini 3 models only. Controls reasoning depth: "low", "medium" (Flash only),
+            "high" (default). Higher levels improve reasoning but increase latency.
+
         Attributes:
         -----------
-        model: genai.GenerativeModel
-            The Gemini model instance.
+        client: genai.Client
+            The Gemini API client instance.
 
         model_name: str
             The name of the Gemini model being used.
@@ -3483,10 +3765,12 @@ try:
 
         def __init__(
             self,
-            api_key: str,
-            model: str = "gemini-1.5-flash",
-            llm_specific_instructions=None,
+            api_key: str = None,
+            model: str = "gemini-3-flash-preview",
+            llm_specific_instructions: str = None,
             max_concurrent_requests: int = 10,
+            thinking_level: str = None,
+            debug: bool = False,
         ):
             api_key = api_key or os.getenv("GOOGLE_API_KEY")
             if not api_key:
@@ -3494,29 +3778,54 @@ try:
                     "Google API key is required. Set it as an environment variable GOOGLE_API_KEY or pass it directly to the constructor."
                 )
 
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(model)
+            self.client = genai.Client(api_key=api_key)
             self.model_name = model
             self.extra_prompting = (
                 "\n\n" + llm_specific_instructions if llm_specific_instructions else ""
             )
             self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+            self.thinking_level = thinking_level
+            self.debug = debug
 
         async def _call_single_llm(
             self, prompt: str, temperature: float, max_tokens: int
         ) -> str:
-            """Call the LLM for a single prompt."""
+            """Call the LLM for a single prompt with structured JSON output."""
             try:
                 async with self.semaphore:
-                    generation_config = genai.types.GenerationConfig(
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
+                    # Detect schema based on max_tokens heuristic
+                    is_disambiguation = max_tokens > 256
+                    json_schema = GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA if is_disambiguation else GEMINI_TOPIC_NAME_SCHEMA
+
+                    # For disambiguation calls with thinking enabled, increase token limit
+                    # because thinking tokens consume part of the output budget
+                    effective_max_tokens = max(max_tokens * 3, 2048) if is_disambiguation else max_tokens
+
+                    config_kwargs = {
+                        "temperature": temperature,
+                        "max_output_tokens": effective_max_tokens,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": json_schema,
+                    }
+
+                    if "gemini-3" in self.model_name:
+                        config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                            thinking_level=self.thinking_level or "low"
+                        )
+
+                    if self.debug:
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Calling {self.model_name}")
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Schema: {'cluster_names' if max_tokens > 256 else 'topic_name'}")
+
+                    response = await self.client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt + self.extra_prompting,
+                        config=genai_types.GenerateContentConfig(**config_kwargs),
                     )
 
-                    response = await self.model.generate_content_async(
-                        prompt + self.extra_prompting,
-                        generation_config=generation_config,
-                    )
+                    if self.debug:
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Response: {response.text}")
+
                     return response.text
             except Exception as e:
                 warn(f"Google Gemini API call failed: {str(e)[:100]}...")
@@ -3529,20 +3838,43 @@ try:
             temperature: float,
             max_tokens: int,
         ) -> str:
-            """Call the LLM for a single prompt with system prompt."""
+            """Call the LLM for a single prompt with system prompt and structured JSON output."""
             try:
                 async with self.semaphore:
-                    generation_config = genai.types.GenerationConfig(
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
+                    # Detect schema based on max_tokens heuristic
+                    is_disambiguation = max_tokens > 256
+                    json_schema = GEMINI_TOPIC_CLUSTER_NAMES_SCHEMA if is_disambiguation else GEMINI_TOPIC_NAME_SCHEMA
+
+                    # For disambiguation calls with thinking enabled, increase token limit
+                    # because thinking tokens consume part of the output budget
+                    effective_max_tokens = max(max_tokens * 3, 2048) if is_disambiguation else max_tokens
+
+                    config_kwargs = {
+                        "temperature": temperature,
+                        "max_output_tokens": effective_max_tokens,
+                        "system_instruction": system_prompt,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": json_schema,
+                    }
+
+                    if "gemini-3" in self.model_name:
+                        config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                            thinking_level=self.thinking_level or "low"
+                        )
+
+                    if self.debug:
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Calling with system prompt")
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Schema: {'cluster_names' if max_tokens > 256 else 'topic_name'}")
+
+                    response = await self.client.aio.models.generate_content(
+                        model=self.model_name,
+                        contents=user_prompt + self.extra_prompting,
+                        config=genai_types.GenerateContentConfig(**config_kwargs),
                     )
 
-                    # Gemini doesn't have explicit system prompts, so we combine them
-                    combined_prompt = f"System: {system_prompt}\n\nUser: {user_prompt + self.extra_prompting}"
+                    if self.debug:
+                        print(f"[DEBUG AsyncGoogleGeminiNamer] Response: {response.text}")
 
-                    response = await self.model.generate_content_async(
-                        combined_prompt, generation_config=generation_config
-                    )
                     return response.text
             except Exception as e:
                 warn(f"Google Gemini API call failed: {str(e)[:100]}...")

@@ -279,6 +279,7 @@ def topic_name_prompt(
     exemplar_end_delimiter: str = "\"\n",
     prompt_format: str = "combined",
     prompt_template: Optional[str] = None,
+    sibling_context: Optional[List[str]] = None,
 ) -> Union[str, Dict[str, str]]:
     """
     Construct a prompt for naming a topic.
@@ -321,6 +322,10 @@ def topic_name_prompt(
     prompt_template : Optional[str], optional
         Custom prompt template to use, by default None. If provided, this will override
         the default prompt template.
+    sibling_context : Optional[List[str]], optional
+        List of strings describing sibling topics under the same parent, e.g.
+        ["Machine Learning (keyphrases: neural networks, deep learning)", ...].
+        Used to encourage the LLM to pick a distinct name. By default None.
 
     Returns
     -------
@@ -367,7 +372,10 @@ def topic_name_prompt(
     
     is_very_specific = "very specific" in summary_kind
     is_general = "general" in summary_kind
-    
+
+    # Limit sibling context to top 3 to avoid making the prompt too long
+    limited_sibling_context = sibling_context[:3] if sibling_context else []
+
     render_params = {
         "document_type": object_description,
         "corpus_description": corpus_description,
@@ -377,6 +385,7 @@ def topic_name_prompt(
             "minor": minor_subtopics,
             "misc": other_subtopics,
         },
+        "sibling_context": limited_sibling_context,
         "cluster_sentences": current_exemplars,
         "summary_kind": summary_kind,
         "exemplar_start_delimiter": exemplar_start_delimiter,

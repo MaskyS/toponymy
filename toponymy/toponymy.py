@@ -132,6 +132,7 @@ class Toponymy:
         exemplar_method: str = "central",
         keyphrase_method: str = "information_weighted",
         subtopic_method: str = "facility_location",
+        adaptive_exemplars: bool = False,
     ):
         """
         Vectorizes using the classes embedding_model and constructs a low dimension data map with UMAP if object_vectors and object_map aren't spec.
@@ -151,6 +152,8 @@ class Toponymy:
             The method to use for generating keyphrases. Default is "information_weighted". Other options are "saturated_coverage", "facility_location", "graph_cut", "central" and "bm25".
         subtopic_method: str, Optional
             The method to use for generating subtopics. Default is "facility_location". Other options are "information_weighted".
+        adaptive_exemplars: bool, Optional
+            If True, adjusts exemplar/keyphrase counts based on cluster sizes.
 
         Returns:
         --------
@@ -175,6 +178,7 @@ class Toponymy:
                 verbose=self.verbose,
                 show_progress_bar=self.show_progress_bars,
                 exemplar_delimiters=self.exemplar_delimiters,
+                adaptive_exemplars=adaptive_exemplars,
                 prompt_format=(
                     "system_user"
                     if self.llm_wrapper.supports_system_prompts
@@ -299,6 +303,7 @@ class Toponymy:
         exemplar_method: str = "central",
         keyphrase_method: str = "information_weighted",
         subtopic_method: str = "facility_location",
+        adaptive_exemplars: bool = False,
     ) -> List[np.array]:
         """
         Fit the model with objects and return the topic names.
@@ -326,6 +331,7 @@ class Toponymy:
             exemplar_method=exemplar_method,
             keyphrase_method=keyphrase_method,
             subtopic_method=subtopic_method,
+            adaptive_exemplars=adaptive_exemplars,
         )
         return self.topic_name_vectors_
 

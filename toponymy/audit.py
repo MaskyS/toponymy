@@ -3,8 +3,13 @@ Audit functionality for Toponymy - Compare intermediate results with LLM outputs
 for transparency and debugging purposes.
 """
 
+import asyncio
+import numpy as np
 import pandas as pd
-from typing import Optional, List, Dict, Union
+from collections import Counter
+from typing import Optional, List, Dict, Union, Tuple
+
+_background_loop = None
 
 
 def create_cluster_audit_df(
@@ -461,3 +466,246 @@ def get_cluster_details(toponymy_instance, layer_index: int, cluster_id: int) ->
         details["prompt"] = layer.prompts[cluster_id]
 
     return details
+
+
+def flag_clusters_for_relabel(
+    toponymy_instance,
+    duplicate_threshold: float = 0.0,
+    specificity_threshold: float = 0.3,
+    keyphrase_alignment_threshold: float = 0.0,
+) -> List[Tuple[int, int, List[str]]]:
+    """
+    Flag clusters whose labels should be regenerated.
+
+    Criteria:
+    - Duplicate label names within the same layer
+    - Low topic_specificity (if stored on the layer/cluster)
+    - Low keyphrase-name alignment (no top-5 keyphrases appear in topic name)
+
+    Args:
+        toponymy_instance: Fitted Toponymy model
+        duplicate_threshold: Minimum duplicate-rate threshold (extra duplicates / topics) to flag duplicate names
+        specificity_threshold: Flag clusters with specificity below this
+        keyphrase_alignment_threshold: Flag clusters with keyphrase-alignment ratio <= this threshold
+
+    Returns:
+        List of (layer_idx, cluster_idx, reasons) tuples for clusters to relabel
+    """
+    from toponymy.llm_wrappers import coerce_topic_specificity
+
+    flagged = []
+
+    for layer_idx, layer in enumerate(toponymy_instance.cluster_layers_):
+        topic_names = layer.topic_names
+
+        # Find duplicate names in this layer
+        name_counts = Counter(topic_names)
+        duplicate_names = {name for name, count in name_counts.items() if count > 1}
+        total_topics = max(1, len(topic_names))
+        duplicate_rate = (len(topic_names) - len(name_counts)) / total_topics
+        duplicate_rate_exceeds = duplicate_rate > duplicate_threshold
+
+        for cluster_idx, name in enumerate(topic_names):
+            reasons = []
+
+            # Check for duplicate names
+            if name in duplicate_names and duplicate_rate_exceeds:
+                reasons.append(f"duplicate_name:{name}")
+
+            # Check topic_specificity if available
+            if hasattr(layer, "topic_specificities") and layer.topic_specificities:
+                raw_specificity = layer.topic_specificities.get(cluster_idx, 1.0)
+                specificity = coerce_topic_specificity(raw_specificity, default=1.0)
+                if specificity < specificity_threshold:
+                    reasons.append(f"low_specificity:{specificity:.2f}")
+
+            # Check keyphrase alignment
+            if cluster_idx < len(layer.keyphrases):
+                top_keyphrases = layer.keyphrases[cluster_idx][:5]
+                name_lower = name.lower()
+                alignment = sum(1 for kp in top_keyphrases if kp.lower() in name_lower)
+                if top_keyphrases:
+                    alignment_ratio = alignment / len(top_keyphrases)
+                    if alignment_ratio <= keyphrase_alignment_threshold:
+                        if alignment == 0 and keyphrase_alignment_threshold == 0.0:
+                            reasons.append("no_keyphrase_alignment")
+                        else:
+                            reasons.append(f"low_keyphrase_alignment:{alignment_ratio:.2f}")
+
+            if reasons:
+                flagged.append((layer_idx, cluster_idx, reasons))
+
+    return flagged
+
+
+def _run_async(coro):
+    """Run async code in both regular Python and notebook-like environments."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Reuse a single loop across calls so loop-bound async primitives
+        # (e.g., semaphores inside wrappers) remain valid.
+        global _background_loop
+        if _background_loop is None or _background_loop.is_closed():
+            _background_loop = asyncio.new_event_loop()
+        return _background_loop.run_until_complete(coro)
+    else:
+        try:
+            import nest_asyncio
+
+            nest_asyncio.apply()
+            return loop.run_until_complete(coro)
+        except ImportError:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+
+
+def run_relabel_pass(
+    toponymy_instance,
+    flagged_clusters: List[Tuple[int, int, List[str]]],
+    llm,
+    max_passes: int = 2,
+) -> Dict[str, int]:
+    """
+    Re-generate labels for flagged clusters.
+
+    For each flagged cluster, re-runs the LLM naming with the existing prompt
+    (the original prompt is stored on the layer). Uses generate_topic_name_with_specificity
+    to capture topic_specificity scores. Runs up to max_passes.
+
+    Args:
+        toponymy_instance: Fitted Toponymy model
+        flagged_clusters: Output from flag_clusters_for_relabel()
+        llm: LLM wrapper instance (sync)
+        max_passes: Maximum number of relabel passes
+
+    Returns:
+        Dict with stats: {relabeled, unchanged, passes_run}
+    """
+    from toponymy.llm_wrappers import AsyncLLMWrapper, LLMWrapper, coerce_topic_specificity
+
+    stats = {"relabeled": 0, "unchanged": 0, "passes_run": 0}
+    attempted_clusters = set()
+    changed_clusters = set()
+
+    for _ in range(max_passes):
+        if not flagged_clusters:
+            break
+        stats["passes_run"] += 1
+        pass_relabeled = 0
+
+        prompt_entries = []
+        for layer_idx, cluster_idx, reasons in flagged_clusters:
+            layer = toponymy_instance.cluster_layers_[layer_idx]
+            if not hasattr(layer, "prompts") or cluster_idx >= len(layer.prompts):
+                continue
+            prompt_entries.append((layer_idx, cluster_idx, layer, layer.prompts[cluster_idx]))
+            attempted_clusters.add((layer_idx, cluster_idx))
+
+        if not prompt_entries:
+            break
+
+        if isinstance(llm, AsyncLLMWrapper):
+            prompts = [entry[3] for entry in prompt_entries]
+            llm_results = [("", None)] * len(prompts)
+
+            # Prompts may be mixed (str + dict). Batch APIs expect homogeneous
+            # prompt types, so process each type separately and merge in-order.
+            str_indices = []
+            str_prompts = []
+            dict_indices = []
+            dict_prompts = []
+            for i, p in enumerate(prompts):
+                if isinstance(p, dict):
+                    dict_indices.append(i)
+                    dict_prompts.append(
+                        {
+                            "system": str(p.get("system", "")),
+                            "user": str(p.get("user", "")),
+                        }
+                    )
+                else:
+                    str_indices.append(i)
+                    str_prompts.append(str(p))
+
+            if hasattr(llm, "generate_topic_names_with_specificity"):
+                if str_prompts:
+                    str_results = _run_async(
+                        llm.generate_topic_names_with_specificity(str_prompts)
+                    )
+                    for i, r in zip(str_indices, str_results):
+                        llm_results[i] = r
+                if dict_prompts:
+                    dict_results = _run_async(
+                        llm.generate_topic_names_with_specificity(dict_prompts)
+                    )
+                    for i, r in zip(dict_indices, dict_results):
+                        llm_results[i] = r
+            elif hasattr(llm, "generate_topic_names"):
+                if str_prompts:
+                    str_names = _run_async(llm.generate_topic_names(str_prompts))
+                    for i, n in zip(str_indices, str_names):
+                        llm_results[i] = (n, None)
+                if dict_prompts:
+                    dict_names = _run_async(llm.generate_topic_names(dict_prompts))
+                    for i, n in zip(dict_indices, dict_names):
+                        llm_results[i] = (n, None)
+            else:
+                raise ValueError("Async LLM wrapper does not support topic naming")
+
+            for (layer_idx, cluster_idx, layer, _), (new_name, specificity) in zip(
+                prompt_entries, llm_results
+            ):
+                old_name = layer.topic_names[cluster_idx]
+                if specificity is not None:
+                    if not hasattr(layer, "topic_specificities") or layer.topic_specificities is None:
+                        layer.topic_specificities = {}
+                    layer.topic_specificities[cluster_idx] = coerce_topic_specificity(
+                        specificity, default=0.0
+                    )
+
+                if new_name and new_name != old_name:
+                    layer.topic_names[cluster_idx] = new_name
+                    if layer_idx < len(toponymy_instance.topic_names_):
+                        toponymy_instance.topic_names_[layer_idx][cluster_idx] = new_name
+                    changed_clusters.add((layer_idx, cluster_idx))
+                    pass_relabeled += 1
+        else:
+            if not isinstance(llm, LLMWrapper) and not hasattr(llm, "generate_topic_name"):
+                raise ValueError("LLM wrapper does not support topic naming")
+
+            for layer_idx, cluster_idx, layer, prompt in prompt_entries:
+                old_name = layer.topic_names[cluster_idx]
+
+                if hasattr(llm, "generate_topic_name_with_specificity"):
+                    new_name, specificity = llm.generate_topic_name_with_specificity(prompt)
+                    if not hasattr(layer, "topic_specificities") or layer.topic_specificities is None:
+                        layer.topic_specificities = {}
+                    layer.topic_specificities[cluster_idx] = coerce_topic_specificity(
+                        specificity, default=0.0
+                    )
+                else:
+                    new_name = llm.generate_topic_name(prompt)
+
+                if new_name and new_name != old_name:
+                    layer.topic_names[cluster_idx] = new_name
+                    if layer_idx < len(toponymy_instance.topic_names_):
+                        toponymy_instance.topic_names_[layer_idx][cluster_idx] = new_name
+                    changed_clusters.add((layer_idx, cluster_idx))
+                    pass_relabeled += 1
+
+        if pass_relabeled == 0:
+            break  # No more changes, stop early
+
+        # Re-flag for next pass
+        flagged_clusters = flag_clusters_for_relabel(toponymy_instance)
+        if not flagged_clusters:
+            break
+
+    stats["relabeled"] = len(changed_clusters)
+    stats["unchanged"] = max(0, len(attempted_clusters) - stats["relabeled"])
+
+    return stats

@@ -32,6 +32,8 @@ import asyncio
 from toponymy._utils import handle_verbose_params
 import warnings
 
+_background_loop = None
+
 
 def run_async(coro):
     """
@@ -40,8 +42,13 @@ def run_async(coro):
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop - regular Python
-        return asyncio.run(coro)
+        # No running loop - regular Python script execution.
+        # Reuse a single loop across calls so async wrappers that keep loop-bound
+        # state (e.g., semaphores) do not break on subsequent invocations.
+        global _background_loop
+        if _background_loop is None or _background_loop.is_closed():
+            _background_loop = asyncio.new_event_loop()
+        return _background_loop.run_until_complete(coro)
     else:
         # Running loop exists - likely Jupyter
         try:
@@ -348,6 +355,7 @@ class ClusterLayerText(ClusterLayer):
         exemplar_delimiters: List[str] = ['    * "', '"\n'],
         prompt_format: str = "combined",
         prompt_template: Optional[str] = None,
+        adaptive_exemplars: bool = False,
         verbose: bool = None,
         show_progress_bar: bool = None,
         **kwargs: Any,
@@ -372,6 +380,92 @@ class ClusterLayerText(ClusterLayer):
         self.subtopic_diversify_alpha = subtopic_diversify_alpha
         if text_embedding_model is not None:
             self.embedding_model = text_embedding_model
+
+        if adaptive_exemplars:
+            # Compute median cluster size for this layer
+            unique_labels = np.unique(cluster_labels[cluster_labels >= 0])
+            sizes = [np.sum(cluster_labels == l) for l in unique_labels]
+            median_size = np.median(sizes) if sizes else 50
+
+            if median_size < 50:
+                self.n_exemplars = 8
+                self.n_keyphrases = 12
+            elif median_size < 200:
+                self.n_exemplars = 16
+                self.n_keyphrases = 20
+            else:
+                self.n_exemplars = 24
+                self.n_keyphrases = 28
+
+    def _build_sibling_context(
+        self,
+        topic_index: int,
+        all_topic_names: List[List[str]],
+        cluster_tree: Optional[dict],
+    ) -> Optional[List[str]]:
+        """Build sibling context for a topic by finding other children of the same parent.
+
+        Parameters
+        ----------
+        topic_index : int
+            The index of the current topic.
+        all_topic_names : List[List[str]]
+            List of topic names for each layer.
+        cluster_tree : Optional[dict]
+            Dictionary of the cluster tree keyed by (layer, cluster_index)
+            with values as lists of (child_layer, child_cluster) tuples.
+
+        Returns
+        -------
+        Optional[List[str]]
+            List of sibling description strings, or None if no siblings found.
+        """
+        if cluster_tree is None:
+            return None
+
+        # Find the parent of (self.layer_id, topic_index) by searching
+        # one layer up for a parent whose children include this topic.
+        parent_key = None
+        for key, children in cluster_tree.items():
+            parent_layer, parent_idx = key
+            if parent_layer == self.layer_id + 1:
+                for child_layer, child_idx in children:
+                    if child_layer == self.layer_id and child_idx == topic_index:
+                        parent_key = key
+                        break
+            if parent_key is not None:
+                break
+
+        if parent_key is None:
+            return None
+
+        # Get all children of the same parent
+        siblings = cluster_tree[parent_key]
+
+        sibling_context = []
+        for child_layer, child_idx in siblings:
+            # Skip the current topic itself
+            if child_layer == self.layer_id and child_idx == topic_index:
+                continue
+            # Only consider siblings at the same layer
+            if child_layer != self.layer_id:
+                continue
+            # Only include siblings that already have names
+            if (
+                child_layer < len(all_topic_names)
+                and child_idx < len(all_topic_names[child_layer])
+                and all_topic_names[child_layer][child_idx]
+            ):
+                name = all_topic_names[child_layer][child_idx]
+                # Include top keyphrases if available
+                if child_idx < len(self.keyphrases) and self.keyphrases[child_idx]:
+                    top_kps = self.keyphrases[child_idx][:5]
+                    desc = f"{name} (keyphrases: {', '.join(top_kps)})"
+                else:
+                    desc = name
+                sibling_context.append(desc)
+
+        return sibling_context if sibling_context else None
 
     def make_prompts(
         self,
@@ -408,6 +502,9 @@ class ClusterLayerText(ClusterLayer):
                 ),
                 prompt_template=(
                     self.prompt_template if prompt_template is None else prompt_template
+                ),
+                sibling_context=self._build_sibling_context(
+                    topic_index, all_topic_names, cluster_tree
                 ),
             )
             for topic_index in tqdm(

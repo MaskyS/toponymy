@@ -35,6 +35,9 @@ large and diverse range of {{document_type}} contained in it at a glance.
 You should primarily make use of the major and minor subtopics of this group to generate a name,
 and ensure the topic name reflects the core essence of *all* major subtopics.
 {% endif %}
+{% if sibling_context %}
+When choosing a name, ensure it is clearly distinct from the other topics in the same category.
+{% endif %}
 Ensure your entire response is only the JSON object, with no other text before or after it.
 """
         ),
@@ -60,6 +63,12 @@ Here is the information about the group of {{document_type}}:
 - Other miscellaneous detailed subtopics of this group in order of relevance (from most to least) include:
 {%- for subtopic in cluster_subtopics["misc"] %}
   * {{subtopic}}
+{%- endfor %}
+{%- endif %}
+{%- if sibling_context %}
+- Other topics in the same category (for contrast — your name should be distinct from these):
+{%- for sibling in sibling_context %}
+  - {{sibling}}
 {%- endfor %}
 {%- endif %}
 {%- if cluster_sentences %}
@@ -100,6 +109,12 @@ are all on the same topic and need to be given topic name.
       * {{subtopic}}
 {%- endfor %}
 {%- endif %}
+{%- if sibling_context %}
+ - Other topics in the same category (for contrast — your name should be distinct from these):
+{%- for sibling in sibling_context %}
+      - {{sibling}}
+{%- endfor %}
+{%- endif %}
 {%- if cluster_sentences %}
  - Sample {{document_type}} from this group include:
 {%- for sentence in cluster_sentences %}
@@ -109,7 +124,7 @@ are all on the same topic and need to be given topic name.
 
 You are to give a {{summary_kind}} name to this group of {{document_type}}.
 {% if has_major_subtopics -%}
-You should primarily make use of the major and minor subtopics of this group to generate a name, 
+You should primarily make use of the major and minor subtopics of this group to generate a name,
 and ensure the topic name covers *all* of the major subtopics.
 {%- endif %}
 {% if is_very_specific_summary -%}

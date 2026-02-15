@@ -1,4 +1,5 @@
 import numpy as np
+import numpy.typing as npt
 from tqdm.auto import tqdm
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
@@ -17,7 +18,7 @@ class TextEmbedderProtocol(Protocol):
         show_progress_bar: Optional[bool],
         *args,
         **kwargs,
-    ) -> np.typing.NDArray[np.floating]: ...
+    ) -> npt.NDArray[np.floating]: ...
 
 
 # Cohere
@@ -293,15 +294,20 @@ try:
                 desc="embedding texts",
                 disable=(not show_progress_bar_val),
             ):
+                batch = texts[i : i + 96]
+                # Filter out empty strings which Voyage API rejects
+                batch = [t if t else " " for t in batch]
                 response = requests.post(
                     self.base_url,
                     headers=self.headers,
                     json={
                         "model": self.model,
-                        "input": texts[i : i + 96],
-                        "encoding_format": "float",
+                        "input": batch,
                     },
                 )
+                if response.status_code != 200:
+                    print(f"Voyage API error {response.status_code}: {response.text[:500]}")
+                    print(f"Batch size: {len(batch)}, first items: {batch[:3]}")
                 response.raise_for_status()
                 data = response.json()
                 result.append(np.array([item["embedding"] for item in data["data"]]))
