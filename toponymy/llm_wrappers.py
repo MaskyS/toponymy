@@ -1631,7 +1631,7 @@ try:
             model-specific instructions or context that may help improve the quality of the generated text.
 
         max_concurrent_requests: int, optional
-            The maximum number of concurrent requests to the Anthropic API. Default is 10. This can be adjusted based on your
+            The maximum number of concurrent requests to the Anthropic API. Default is 25. This can be adjusted based on your
             application's needs and the rate limits of the Anthropic API. Higher values may improve throughput but could lead to rate limiting.
 
         Attributes:
@@ -1654,7 +1654,7 @@ try:
             api_key: str,
             model: str = "claude-3-haiku-20240307",
             llm_specific_instructions=None,
-            max_concurrent_requests: int = 10,
+            max_concurrent_requests: int = 25,
         ):
 
             api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -1674,16 +1674,29 @@ try:
             self, prompt: str, temperature: float, max_tokens: int
         ) -> str:
             """Call the LLM for a single prompt."""
-            async with self.semaphore:
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    messages=[
-                        {"role": "user", "content": prompt + self.extra_prompting}
-                    ],
-                    temperature=temperature,
-                )
-                return response.content[0].text
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    async with self.semaphore:
+                        response = await self.client.messages.create(
+                            model=self.model,
+                            max_tokens=max_tokens,
+                            messages=[
+                                {"role": "user", "content": prompt + self.extra_prompting}
+                            ],
+                            temperature=temperature,
+                        )
+                        return response.content[0].text
+                except Exception as e:
+                    err_str = str(e)[:200]
+                    is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                    if is_rate_limit and attempt < max_retries - 1:
+                        delay = 2 ** (attempt + 1)
+                        warn(f"Rate limited, retrying in {delay}s: {err_str}")
+                        await asyncio.sleep(delay)
+                        continue
+                    warn(f"Anthropic API call failed: {err_str}")
+                    return ""
 
         async def _call_single_llm_with_system(
             self,
@@ -1693,17 +1706,30 @@ try:
             max_tokens: int,
         ) -> str:
             """Call the LLM for a single prompt with system prompt."""
-            async with self.semaphore:
-                response = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_prompt + self.extra_prompting},
-                    ],
-                    temperature=temperature,
-                )
-                return response.content[0].text
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    async with self.semaphore:
+                        response = await self.client.messages.create(
+                            model=self.model,
+                            max_tokens=max_tokens,
+                            system=system_prompt,
+                            messages=[
+                                {"role": "user", "content": user_prompt + self.extra_prompting},
+                            ],
+                            temperature=temperature,
+                        )
+                        return response.content[0].text
+                except Exception as e:
+                    err_str = str(e)[:200]
+                    is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                    if is_rate_limit and attempt < max_retries - 1:
+                        delay = 2 ** (attempt + 1)
+                        warn(f"Rate limited, retrying in {delay}s: {err_str}")
+                        await asyncio.sleep(delay)
+                        continue
+                    warn(f"Anthropic API call failed: {err_str}")
+                    return ""
 
         async def _call_llm_batch(
             self, prompts: List[str], temperature: float, max_tokens: int
@@ -2272,7 +2298,7 @@ try:
             model-specific instructions or context that may help improve the quality of the generated text.
 
         max_concurrent_requests: int, optional
-            The maximum number of concurrent requests to the OpenAI API. Default is 10. This can be adjusted based on your
+            The maximum number of concurrent requests to the OpenAI API. Default is 25. This can be adjusted based on your
             application's needs and the rate limits of the OpenAI API. Higher values may improve throughput but could lead to rate limiting.
 
         organization: str, optional
@@ -2304,7 +2330,7 @@ try:
             api_key: str,
             model: str = "gpt-4o-mini",
             llm_specific_instructions=None,
-            max_concurrent_requests: int = 10,
+            max_concurrent_requests: int = 25,
             organization: str = None,
             base_url: str = None,
         ):
@@ -2331,37 +2357,46 @@ try:
             self, prompt: str, temperature: float, max_tokens: int
         ) -> str:
             """Call the LLM for a single prompt."""
-            try:
-                async with self.semaphore:
-                    if self._is_gpt5_model():
-                        input_text = prompt + self.extra_prompting
-                        if "json" not in input_text.lower():
-                            input_text += "\n\nRespond with JSON."
-                        response = await self.client.responses.create(
-                            model=self.model,
-                            input=input_text,
-                            reasoning={"effort": "minimal"},
-                            max_output_tokens=max_tokens,
-                            text={"format": {"type": "json_object"}},
-                        )
-                        return response.output_text
-                    else:
-                        response = await self.client.chat.completions.create(
-                            model=self.model,
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": prompt + self.extra_prompting,
-                                }
-                            ],
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            response_format={"type": "json_object"},
-                        )
-                        return response.choices[0].message.content
-            except Exception as e:
-                warn(f"OpenAI API call failed: {str(e)[:100]}...")
-                return ""
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    async with self.semaphore:
+                        if self._is_gpt5_model():
+                            input_text = prompt + self.extra_prompting
+                            if "json" not in input_text.lower():
+                                input_text += "\n\nRespond with JSON."
+                            response = await self.client.responses.create(
+                                model=self.model,
+                                input=input_text,
+                                reasoning={"effort": "minimal"},
+                                max_output_tokens=max_tokens,
+                                text={"format": {"type": "json_object"}},
+                            )
+                            return response.output_text
+                        else:
+                            response = await self.client.chat.completions.create(
+                                model=self.model,
+                                messages=[
+                                    {
+                                        "role": "user",
+                                        "content": prompt + self.extra_prompting,
+                                    }
+                                ],
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                response_format={"type": "json_object"},
+                            )
+                            return response.choices[0].message.content
+                except Exception as e:
+                    err_str = str(e)[:200]
+                    is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                    if is_rate_limit and attempt < max_retries - 1:
+                        delay = 2 ** (attempt + 1)
+                        warn(f"Rate limited, retrying in {delay}s: {err_str}")
+                        await asyncio.sleep(delay)
+                        continue
+                    warn(f"OpenAI API call failed: {err_str}")
+                    return ""
 
         async def _call_single_llm_with_system(
             self,
@@ -2371,39 +2406,48 @@ try:
             max_tokens: int,
         ) -> str:
             """Call the LLM for a single prompt with system prompt."""
-            try:
-                async with self.semaphore:
-                    if self._is_gpt5_model():
-                        input_text = user_prompt + self.extra_prompting
-                        if "json" not in input_text.lower():
-                            input_text += "\n\nRespond with JSON."
-                        response = await self.client.responses.create(
-                            model=self.model,
-                            instructions=system_prompt,
-                            input=input_text,
-                            reasoning={"effort": "minimal"},
-                            max_output_tokens=max_tokens,
-                            text={"format": {"type": "json_object"}},
-                        )
-                        return response.output_text
-                    else:
-                        response = await self.client.chat.completions.create(
-                            model=self.model,
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {
-                                    "role": "user",
-                                    "content": user_prompt + self.extra_prompting,
-                                },
-                            ],
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            response_format={"type": "json_object"},
-                        )
-                        return response.choices[0].message.content
-            except Exception as e:
-                warn(f"OpenAI API call failed: {str(e)[:100]}...")
-                return ""
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    async with self.semaphore:
+                        if self._is_gpt5_model():
+                            input_text = user_prompt + self.extra_prompting
+                            if "json" not in input_text.lower():
+                                input_text += "\n\nRespond with JSON."
+                            response = await self.client.responses.create(
+                                model=self.model,
+                                instructions=system_prompt,
+                                input=input_text,
+                                reasoning={"effort": "minimal"},
+                                max_output_tokens=max_tokens,
+                                text={"format": {"type": "json_object"}},
+                            )
+                            return response.output_text
+                        else:
+                            response = await self.client.chat.completions.create(
+                                model=self.model,
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {
+                                        "role": "user",
+                                        "content": user_prompt + self.extra_prompting,
+                                    },
+                                ],
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                response_format={"type": "json_object"},
+                            )
+                            return response.choices[0].message.content
+                except Exception as e:
+                    err_str = str(e)[:200]
+                    is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                    if is_rate_limit and attempt < max_retries - 1:
+                        delay = 2 ** (attempt + 1)
+                        warn(f"Rate limited, retrying in {delay}s: {err_str}")
+                        await asyncio.sleep(delay)
+                        continue
+                    warn(f"OpenAI API call failed: {err_str}")
+                    return ""
 
         async def _call_llm_batch(
             self, prompts: List[str], temperature: float, max_tokens: int
