@@ -3,13 +3,11 @@ Audit functionality for Toponymy - Compare intermediate results with LLM outputs
 for transparency and debugging purposes.
 """
 
-import asyncio
 import numpy as np
 import pandas as pd
 from collections import Counter
 from typing import Optional, List, Dict, Union, Tuple
-
-_background_loop = None
+from toponymy.cluster_layer import run_async
 
 
 def create_cluster_audit_df(
@@ -538,31 +536,6 @@ def flag_clusters_for_relabel(
     return flagged
 
 
-def _run_async(coro):
-    """Run async code in both regular Python and notebook-like environments."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # Reuse a single loop across calls so loop-bound async primitives
-        # (e.g., semaphores inside wrappers) remain valid.
-        global _background_loop
-        if _background_loop is None or _background_loop.is_closed():
-            _background_loop = asyncio.new_event_loop()
-        return _background_loop.run_until_complete(coro)
-    else:
-        try:
-            import nest_asyncio
-
-            nest_asyncio.apply()
-            return loop.run_until_complete(coro)
-        except ImportError:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result()
-
-
 def run_relabel_pass(
     toponymy_instance,
     flagged_clusters: List[Tuple[int, int, List[str]]],
@@ -633,24 +606,24 @@ def run_relabel_pass(
 
             if hasattr(llm, "generate_topic_names_with_specificity"):
                 if str_prompts:
-                    str_results = _run_async(
+                    str_results = run_async(
                         llm.generate_topic_names_with_specificity(str_prompts)
                     )
                     for i, r in zip(str_indices, str_results):
                         llm_results[i] = r
                 if dict_prompts:
-                    dict_results = _run_async(
+                    dict_results = run_async(
                         llm.generate_topic_names_with_specificity(dict_prompts)
                     )
                     for i, r in zip(dict_indices, dict_results):
                         llm_results[i] = r
             elif hasattr(llm, "generate_topic_names"):
                 if str_prompts:
-                    str_names = _run_async(llm.generate_topic_names(str_prompts))
+                    str_names = run_async(llm.generate_topic_names(str_prompts))
                     for i, n in zip(str_indices, str_names):
                         llm_results[i] = (n, None)
                 if dict_prompts:
-                    dict_names = _run_async(llm.generate_topic_names(dict_prompts))
+                    dict_names = run_async(llm.generate_topic_names(dict_prompts))
                     for i, n in zip(dict_indices, dict_names):
                         llm_results[i] = (n, None)
             else:
