@@ -60,6 +60,7 @@ class MockLLMResponse:
         class Response:
             def __init__(self, content):
                 self.choices = [Choice(content)]
+                self.output_text = content
         
         return Response(content)
     
@@ -308,51 +309,52 @@ def openai_wrapper():
 
 def test_openai_generate_topic_name_success(openai_wrapper, mock_data):
     response = MockLLMResponse.create_openai_response(mock_data["valid_topic_name"])
-    openai_wrapper.llm.chat.completions.create = Mock(return_value=response)
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     
     result = openai_wrapper.generate_topic_name("test prompt")
     validate_topic_name(result)
 
 def test_openai_generate_topic_name_success_system_prompt(openai_wrapper, mock_data):
     response = MockLLMResponse.create_openai_response(mock_data["valid_topic_name"])
-    openai_wrapper.llm.chat.completions.create = Mock(return_value=response)
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     
     result = openai_wrapper.generate_topic_name({"system": "system prompt", "user": "test prompt"})
     validate_topic_name(result)
 
 def test_openai_generate_cluster_names_success(openai_wrapper, mock_data):
     response = MockLLMResponse.create_openai_response(mock_data["valid_cluster_names"])
-    openai_wrapper.llm.chat.completions.create = Mock(return_value=response)
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     
     result = openai_wrapper.generate_topic_cluster_names("test prompt", mock_data["old_names"])
     validate_cluster_names(result)
 
 def test_openai_generate_cluster_names_success_system_prompt(openai_wrapper, mock_data):
     response = MockLLMResponse.create_openai_response(mock_data["valid_cluster_names"])
-    openai_wrapper.llm.chat.completions.create = Mock(return_value=response)
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     
     result = openai_wrapper.generate_topic_cluster_names({"system": "system prompt", "user": "test prompt"}, mock_data["old_names"])
     validate_cluster_names(result)
 
 def test_openai_generate_cluster_names_success_on_malformed_mapping(openai_wrapper, mock_data):
     response = MockLLMResponse.create_openai_response(mock_data["malformed_mapping"])
-    openai_wrapper.llm.chat.completions.create = Mock(return_value=response)
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     
     result = openai_wrapper.generate_topic_cluster_names("test prompt", mock_data["old_names"])
     validate_cluster_names(result)
 
 def test_openai_generate_topic_name_failure(openai_wrapper):
-    openai_wrapper.llm.messages.create = Mock(side_effect=Exception("API Error"))
+    openai_wrapper.llm.responses.create = Mock(side_effect=Exception("API Error"))
     result = openai_wrapper.generate_topic_name("test prompt")
     assert result == ""
 
 def test_openai_generate_topic_name_failure_malformed_json(openai_wrapper, mock_data):
-    openai_wrapper.llm.messages.create = Mock(mock_data["malformed_json"])
+    response = MockLLMResponse.create_openai_response(mock_data["malformed_json"])
+    openai_wrapper.llm.responses.create = Mock(return_value=response)
     result = openai_wrapper.generate_topic_name("test prompt")
     assert result == ""
 
 def test_openai_generate_cluster_names_failure(openai_wrapper, mock_data):
-    openai_wrapper.llm.messages.create = Mock(side_effect=Exception("API Error"))
+    openai_wrapper.llm.responses.create = Mock(side_effect=Exception("API Error"))
     result = openai_wrapper.generate_topic_cluster_names("test prompt", mock_data["old_names"])
     assert result == mock_data["old_names"]
 

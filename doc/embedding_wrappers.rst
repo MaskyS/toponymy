@@ -429,7 +429,7 @@ Embedding wrappers integrate seamlessly with Toponymy's main workflow. Here's ho
     
     llm_model = OpenAI(
         api_key="your-openai-api-key",
-        model="gpt-4o-mini"
+        model="gpt-5-mini"
     )
     
     # Create Toponymy instance
@@ -450,7 +450,7 @@ You can use local embeddings with API-based LLMs, or vice versa, depending on yo
     
     # Local embeddings for privacy, API LLM for quality
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    llm_model = OpenAI(api_key="your-api-key", model="gpt-4o-mini")
+    llm_model = OpenAI(api_key="your-api-key", model="gpt-5-mini")
     
     topic_model = Toponymy(
         llm_wrapper=llm_model,

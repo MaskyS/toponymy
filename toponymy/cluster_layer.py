@@ -35,6 +35,92 @@ import warnings
 _background_loop = None
 
 
+def _normalize_exemplar_group_id(value: Any, fallback: int) -> str:
+    text = str(value).strip() if value is not None else ""
+    return text or f"row-{fallback}"
+
+
+def rebalance_exemplar_indices_by_group(
+    exemplar_indices: List[int],
+    cluster_member_indices: np.ndarray,
+    exemplar_group_ids: np.ndarray,
+    candidate_order: np.ndarray,
+    *,
+    target_unique_ratio: float = 0.5,
+    min_group_count_for_diversification: int = 3,
+) -> List[int]:
+    """Softly diversify exemplars across groups while preserving room for depth.
+
+    If a cluster only has one or two groups, we keep the original exemplar order so a
+    coherent thread can still contribute multiple tweets. When a cluster has more
+    distinct groups, we ensure that roughly half of the exemplar slots cover different
+    groups, then fill the remaining slots from the original representative ordering.
+    """
+    if len(exemplar_indices) <= 1:
+        return list(exemplar_indices)
+
+    available_groups = {
+        _normalize_exemplar_group_id(exemplar_group_ids[idx], int(idx))
+        for idx in cluster_member_indices.tolist()
+    }
+    if len(available_groups) < int(min_group_count_for_diversification):
+        return list(exemplar_indices)
+
+    target_unique_groups = min(
+        len(exemplar_indices),
+        len(available_groups),
+        max(
+            int(min_group_count_for_diversification),
+            int(np.ceil(len(exemplar_indices) * float(target_unique_ratio))),
+        ),
+    )
+
+    result: List[int] = []
+    used_indices: set[int] = set()
+    covered_groups: set[str] = set()
+
+    for idx in exemplar_indices:
+        group_id = _normalize_exemplar_group_id(exemplar_group_ids[idx], int(idx))
+        if group_id in covered_groups:
+            continue
+        result.append(int(idx))
+        used_indices.add(int(idx))
+        covered_groups.add(group_id)
+
+    if len(covered_groups) < target_unique_groups:
+        for idx in candidate_order.tolist():
+            idx = int(idx)
+            if idx in used_indices:
+                continue
+            group_id = _normalize_exemplar_group_id(exemplar_group_ids[idx], idx)
+            if group_id in covered_groups:
+                continue
+            result.append(idx)
+            used_indices.add(idx)
+            covered_groups.add(group_id)
+            if len(covered_groups) >= target_unique_groups:
+                break
+
+    for idx in exemplar_indices:
+        idx = int(idx)
+        if idx in used_indices:
+            continue
+        result.append(idx)
+        used_indices.add(idx)
+
+    if len(result) < len(exemplar_indices):
+        for idx in candidate_order.tolist():
+            idx = int(idx)
+            if idx in used_indices:
+                continue
+            result.append(idx)
+            used_indices.add(idx)
+            if len(result) >= len(exemplar_indices):
+                break
+
+    return result[: len(exemplar_indices)]
+
+
 def run_async(coro):
     """
     Run an async coroutine in both Jupyter and regular Python environments.
@@ -352,6 +438,10 @@ class ClusterLayerText(ClusterLayer):
         exemplars_diversify_alpha: float = 1.0,
         n_subtopics: int = 16,
         subtopic_diversify_alpha: float = 1.0,
+        exemplar_group_ids: Optional[List[Any]] = None,
+        soft_exemplar_group_diversity: bool = False,
+        exemplar_group_diversity_ratio: float = 0.5,
+        min_exemplar_group_count_for_diversification: int = 3,
         exemplar_delimiters: List[str] = ['    * "', '"\n'],
         prompt_format: str = "combined",
         prompt_template: Optional[str] = None,
@@ -378,6 +468,18 @@ class ClusterLayerText(ClusterLayer):
         self.exemplars_diversify_alpha = exemplars_diversify_alpha
         self.n_subtopics = n_subtopics
         self.subtopic_diversify_alpha = subtopic_diversify_alpha
+        self.topic_specificities = {}
+        self.detail_level = None
+        self.exemplar_group_ids = (
+            np.asarray(exemplar_group_ids, dtype=object)
+            if exemplar_group_ids is not None
+            else None
+        )
+        self.soft_exemplar_group_diversity = bool(soft_exemplar_group_diversity)
+        self.exemplar_group_diversity_ratio = float(exemplar_group_diversity_ratio)
+        self.min_exemplar_group_count_for_diversification = int(
+            min_exemplar_group_count_for_diversification
+        )
         if text_embedding_model is not None:
             self.embedding_model = text_embedding_model
 
@@ -442,7 +544,10 @@ class ClusterLayerText(ClusterLayer):
         # Get all children of the same parent
         siblings = cluster_tree[parent_key]
 
-        sibling_context = []
+        sibling_candidates = []
+        current_centroid = None
+        if topic_index < len(self.centroid_vectors):
+            current_centroid = self.centroid_vectors[topic_index]
         for child_layer, child_idx in siblings:
             # Skip the current topic itself
             if child_layer == self.layer_id and child_idx == topic_index:
@@ -463,9 +568,63 @@ class ClusterLayerText(ClusterLayer):
                     desc = f"{name} (keyphrases: {', '.join(top_kps)})"
                 else:
                     desc = name
-                sibling_context.append(desc)
+                distance = float("inf")
+                if (
+                    current_centroid is not None
+                    and child_idx < len(self.centroid_vectors)
+                ):
+                    distance = float(
+                        np.linalg.norm(self.centroid_vectors[child_idx] - current_centroid)
+                    )
+                sibling_candidates.append((distance, desc))
 
+        sibling_candidates.sort(key=lambda x: x[0])
+        sibling_context = [desc for _, desc in sibling_candidates]
         return sibling_context if sibling_context else None
+
+    def build_topic_prompt(
+        self,
+        topic_index: int,
+        detail_level: float,
+        all_topic_names: List[List[str]],
+        object_description: str,
+        corpus_description: str,
+        cluster_tree: Optional[dict] = None,
+        prompt_format: str = None,
+        prompt_template: Optional[str] = None,
+        previous_topic_name: Optional[str] = None,
+        repair_reasons: Optional[List[str]] = None,
+    ) -> Union[str, Dict[str, str]]:
+        summary_level = int(round(detail_level * (len(SUMMARY_KINDS) - 1)))
+        summary_kind = SUMMARY_KINDS[summary_level]
+        return topic_name_prompt(
+            topic_index,
+            self.layer_id,
+            all_topic_names,
+            exemplar_texts=self.exemplars,
+            keyphrases=self.keyphrases,
+            subtopics=self.subtopics,
+            cluster_tree=cluster_tree,
+            object_description=object_description,
+            corpus_description=corpus_description,
+            summary_kind=summary_kind,
+            max_num_exemplars=self.n_exemplars,
+            max_num_keyphrases=self.n_keyphrases,
+            max_num_subtopics=self.n_subtopics,
+            exemplar_start_delimiter=self.exemplar_delimiters[0],
+            exemplar_end_delimiter=self.exemplar_delimiters[1],
+            prompt_format=(
+                self.prompt_format if prompt_format is None else prompt_format
+            ),
+            prompt_template=(
+                self.prompt_template if prompt_template is None else prompt_template
+            ),
+            sibling_context=self._build_sibling_context(
+                topic_index, all_topic_names, cluster_tree
+            ),
+            previous_topic_name=previous_topic_name,
+            repair_reasons=repair_reasons,
+        )
 
     def make_prompts(
         self,
@@ -477,35 +636,18 @@ class ClusterLayerText(ClusterLayer):
         prompt_format: str = None,
         prompt_template: Optional[str] = None,
     ) -> List[str]:
-        summary_level = int(round(detail_level * (len(SUMMARY_KINDS) - 1)))
-        summary_kind = SUMMARY_KINDS[summary_level]
+        self.detail_level = float(detail_level)
 
         self.prompts = [
-            topic_name_prompt(
-                topic_index,
-                self.layer_id,
-                all_topic_names,
-                exemplar_texts=self.exemplars,
-                keyphrases=self.keyphrases,
-                subtopics=self.subtopics,
-                cluster_tree=cluster_tree,
+            self.build_topic_prompt(
+                topic_index=topic_index,
+                detail_level=detail_level,
+                all_topic_names=all_topic_names,
                 object_description=object_description,
                 corpus_description=corpus_description,
-                summary_kind=summary_kind,
-                max_num_exemplars=self.n_exemplars,
-                max_num_keyphrases=self.n_keyphrases,
-                max_num_subtopics=self.n_subtopics,
-                exemplar_start_delimiter=self.exemplar_delimiters[0],
-                exemplar_end_delimiter=self.exemplar_delimiters[1],
-                prompt_format=(
-                    self.prompt_format if prompt_format is None else prompt_format
-                ),
-                prompt_template=(
-                    self.prompt_template if prompt_template is None else prompt_template
-                ),
-                sibling_context=self._build_sibling_context(
-                    topic_index, all_topic_names, cluster_tree
-                ),
+                cluster_tree=cluster_tree,
+                prompt_format=prompt_format,
+                prompt_template=prompt_template,
             )
             for topic_index in tqdm(
                 range(self.centroid_vectors.shape[0]),
@@ -530,14 +672,11 @@ class ClusterLayerText(ClusterLayer):
         cluster_tree: Optional[dict] = None,
         embedding_model: Optional[TextEmbedderProtocol] = None,
     ) -> List[str]:
+        self.topic_specificities = {}
         if isinstance(llm, LLMWrapper):
-            self.topic_names = [
-                (
-                    llm.generate_topic_name(prompt)
-                    if isinstance(prompt, dict) or not prompt.startswith("[!SKIP!]: ")
-                    else prompt.removeprefix("[!SKIP!]: ")
-                )
-                for prompt in tqdm(
+            self.topic_names = []
+            for cluster_idx, prompt in enumerate(
+                tqdm(
                     self.prompts,
                     desc=f"Generating topic names for layer {self.layer_id}",
                     disable=not self.show_progress_bar,
@@ -545,26 +684,22 @@ class ClusterLayerText(ClusterLayer):
                     leave=False,
                     position=1,
                 )
-            ]
-        elif isinstance(llm, AsyncLLMWrapper):
-            # Filter out prompts that are marked to be skipped
-            prompts_for_llm = [
-                (index, prompt)
-                for index, prompt in enumerate(self.prompts)
-                if isinstance(prompt, dict) or not prompt.startswith("[!SKIP!]: ")
-            ]
-            llm_results = run_async(
-                llm.generate_topic_names([prompt for _, prompt in prompts_for_llm])
-            )
-            llm_result_index = 0
-            self.topic_names = []
-            for index, prompt in enumerate(self.prompts):
-                if isinstance(prompt, dict) or not prompt.startswith("[!SKIP!]: "):
-                    self.topic_names.append(llm_results[llm_result_index])
-                    llm_result_index += 1
+            ):
+                if hasattr(llm, "generate_topic_name_with_specificity"):
+                    topic_name, specificity = llm.generate_topic_name_with_specificity(prompt)
+                    self.topic_specificities[cluster_idx] = specificity
                 else:
-                    # If the prompt is marked to be skipped, use the original prompt text
-                    self.topic_names.append(prompt.removeprefix("[!SKIP!]: "))
+                    topic_name = llm.generate_topic_name(prompt)
+                self.topic_names.append(topic_name)
+        elif isinstance(llm, AsyncLLMWrapper):
+            if hasattr(llm, "generate_topic_names_with_specificity"):
+                llm_results = run_async(llm.generate_topic_names_with_specificity(self.prompts))
+                self.topic_names = []
+                for cluster_idx, (topic_name, specificity) in enumerate(llm_results):
+                    self.topic_names.append(topic_name)
+                    self.topic_specificities[cluster_idx] = specificity
+            else:
+                self.topic_names = run_async(llm.generate_topic_names(self.prompts))
 
         all_topic_names[self.layer_id] = self.topic_names
         self.disambiguate_topics(
@@ -591,20 +726,32 @@ class ClusterLayerText(ClusterLayer):
         # Try to fix any failures to generate a name
         if any([name == "" for name in self.topic_names]):
             if isinstance(llm, LLMWrapper):
-                self.topic_names = [
-                    llm.generate_topic_name(prompt) if name == "" else name
-                    for name, prompt in zip(self.topic_names, self.prompts)
-                ]
+                repaired_names = []
+                for cluster_idx, (name, prompt) in enumerate(zip(self.topic_names, self.prompts)):
+                    if name != "":
+                        repaired_names.append(name)
+                        continue
+                    if hasattr(llm, "generate_topic_name_with_specificity"):
+                        repaired_name, specificity = llm.generate_topic_name_with_specificity(prompt)
+                        self.topic_specificities[cluster_idx] = specificity
+                        repaired_names.append(repaired_name)
+                    else:
+                        repaired_names.append(llm.generate_topic_name(prompt))
+                self.topic_names = repaired_names
             elif isinstance(llm, AsyncLLMWrapper):
-                selected_prompts = [
-                    prompt
-                    for name, prompt in zip(self.topic_names, self.prompts)
-                    if name == ""
+                selected_indices = [
+                    i for i, name in enumerate(self.topic_names) if name == ""
                 ]
-                llm_results = run_async(llm.generate_topic_names(selected_prompts))
-                for i in range(len(self.topic_names)):
-                    if self.topic_names[i] == "":
-                        self.topic_names[i] = llm_results.pop(0)
+                selected_prompts = [self.prompts[i] for i in selected_indices]
+                if hasattr(llm, "generate_topic_names_with_specificity"):
+                    llm_results = run_async(llm.generate_topic_names_with_specificity(selected_prompts))
+                    for idx, (repaired_name, specificity) in zip(selected_indices, llm_results):
+                        self.topic_names[idx] = repaired_name
+                        self.topic_specificities[idx] = specificity
+                else:
+                    llm_results = run_async(llm.generate_topic_names(selected_prompts))
+                    for idx, repaired_name in zip(selected_indices, llm_results):
+                        self.topic_names[idx] = repaired_name
             else:
                 raise ValueError(
                     "LLM must be an instance of LLMWrapper or AsyncLLMWrapper."
@@ -770,6 +917,38 @@ class ClusterLayerText(ClusterLayer):
             raise ValueError(
                 f"Unknown exemplar generation method: {method}. " "Use 'central'."
             )
+
+        if self.soft_exemplar_group_diversity and self.exemplar_group_ids is not None:
+            for cluster_idx, exemplar_indices in enumerate(self.exemplar_indices):
+                if not exemplar_indices:
+                    continue
+                cluster_member_indices = np.flatnonzero(self.cluster_labels == cluster_idx)
+                if cluster_member_indices.size == 0:
+                    continue
+                centroid = self.centroid_vectors[cluster_idx]
+                distances = np.linalg.norm(
+                    object_vectors[cluster_member_indices] - centroid,
+                    axis=1,
+                )
+                candidate_order = cluster_member_indices[np.argsort(distances)]
+                rebalanced_indices = rebalance_exemplar_indices_by_group(
+                    exemplar_indices,
+                    cluster_member_indices,
+                    self.exemplar_group_ids,
+                    candidate_order,
+                    target_unique_ratio=self.exemplar_group_diversity_ratio,
+                    min_group_count_for_diversification=self.min_exemplar_group_count_for_diversification,
+                )
+                if rebalanced_indices == exemplar_indices:
+                    continue
+                self.exemplar_indices[cluster_idx] = rebalanced_indices
+                selected_objects = [object_list[idx] for idx in rebalanced_indices]
+                if self.object_to_text_function is not None:
+                    self.exemplars[cluster_idx] = self.object_to_text_function(
+                        selected_objects
+                    )
+                else:
+                    self.exemplars[cluster_idx] = [str(obj) for obj in selected_objects]
 
         return self.exemplars, self.exemplar_indices
 

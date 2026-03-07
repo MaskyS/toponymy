@@ -280,6 +280,8 @@ def topic_name_prompt(
     prompt_format: str = "combined",
     prompt_template: Optional[str] = None,
     sibling_context: Optional[List[str]] = None,
+    previous_topic_name: Optional[str] = None,
+    repair_reasons: Optional[List[str]] = None,
 ) -> Union[str, Dict[str, str]]:
     """
     Construct a prompt for naming a topic.
@@ -339,9 +341,6 @@ def topic_name_prompt(
             else []
         )
 
-        if len(tree_subtopics) == 1 and all_topic_names[tree_subtopics[0][0]][tree_subtopics[0][1]] != "":
-            return f"[!SKIP!]: {all_topic_names[tree_subtopics[0][0]][tree_subtopics[0][1]]}"
-
         # Subtopics one layer down are major subtopics; two layers down are minor
         major_subtopics = [
             all_topic_names[x[0]][x[1]] for x in tree_subtopics if x[0] == layer_id - 1
@@ -393,6 +392,8 @@ def topic_name_prompt(
         "is_very_specific_summary": is_very_specific,
         "is_general_summary": is_general,
         "has_major_subtopics": bool(major_subtopics),
+        "previous_topic_name": previous_topic_name,
+        "repair_reasons": repair_reasons or [],
     }
 
     if prompt_template is not None:

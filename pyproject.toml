@@ -29,7 +29,7 @@ dependencies = [
     "scikit-learn>=1.6",
     "vectorizers",
     "scipy",
-    "fast_hdbscan>=0.2.2",
+    "fast_hdbscan @ git+https://github.com/TutteInstitute/fast_hdbscan.git@2ee3a7703f0bb00be0c210a04556028479f9a55d",
     "dataclasses",
     "tqdm",
     "tenacity",

@@ -199,6 +199,55 @@ def test_topic_name_prompt_with_empty_subtopics():
     assert prompt == expected_prompt
 
 
+def test_topic_name_prompt_with_repair_context():
+    topic_index = 0
+    layer_id = 1
+    all_topic_names = [["Topic A"], ["Topic B"]]
+    exemplar_texts = [["Example text for Topic A"], ["Example text for Topic B"]]
+    keyphrases = [["keyphrase1", "keyphrase2"], ["keyphrase3", "keyphrase4"]]
+    subtopics = None
+    cluster_tree = None
+    object_description = "document"
+    corpus_description = "corpus"
+    summary_kind = "summary"
+    previous_topic_name = "General discussion"
+    repair_reasons = ["The previous label was too generic for the evidence."]
+
+    expected_prompt = PROMPT_TEMPLATES["layer"]["combined"].render(
+        document_type=object_description,
+        corpus_description=corpus_description,
+        cluster_keywords=keyphrases[topic_index][:32],
+        cluster_subtopics={
+            "major": [],
+            "minor": [],
+            "misc": [],
+        },
+        cluster_sentences=exemplar_texts[topic_index][:128],
+        summary_kind=summary_kind,
+        exemplar_start_delimiter="    * \"",
+        exemplar_end_delimiter="\"\n",
+        previous_topic_name=previous_topic_name,
+        repair_reasons=repair_reasons,
+    )
+
+    prompt = topic_name_prompt(
+        topic_index,
+        layer_id,
+        all_topic_names,
+        exemplar_texts,
+        keyphrases,
+        subtopics,
+        cluster_tree,
+        object_description,
+        corpus_description,
+        summary_kind,
+        previous_topic_name=previous_topic_name,
+        repair_reasons=repair_reasons,
+    )
+
+    assert prompt == expected_prompt
+
+
 def test_find_threshold_for_max_cluster_size():
     distances = np.array(
         [

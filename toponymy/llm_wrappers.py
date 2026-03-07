@@ -65,7 +65,13 @@ def repair_json_string_backslashes(s: str) -> str:
 
 
 def llm_output_to_result(llm_output: str, regex: str) -> dict:
-    json_portion = re.findall(regex, llm_output, re.DOTALL)[0]
+    matches = re.findall(regex, llm_output, re.DOTALL)
+    if not matches:
+        try:
+            return json.loads(llm_output)
+        except json.JSONDecodeError:
+            raise ValueError(f"No regex match found in LLM output: {llm_output[:200]}")
+    json_portion = matches[0]
     try:
         result = json.loads(json_portion)
     except json.JSONDecodeError:
@@ -83,6 +89,73 @@ def coerce_topic_specificity(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, parsed))
+
+
+TOPIC_NAME_JSON_SCHEMA = {
+    "name": "topic_name_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["topic_name", "topic_specificity"],
+        "properties": {
+            "topic_name": {
+                "type": "string",
+                "description": "A specific, browse-useful label for the cluster.",
+            },
+            "topic_specificity": {
+                "type": "number",
+                "description": "How specific and well-supported the topic label is (0-1).",
+            },
+        },
+    },
+}
+
+
+# strict: False because new_topic_name_mapping uses dynamic keys which are
+# incompatible with OpenAI's strict structured output (requires all properties
+# enumerated + additionalProperties: false).
+TOPIC_CLUSTER_NAMES_JSON_SCHEMA = {
+    "name": "topic_cluster_names_result",
+    "strict": False,
+    "schema": {
+        "type": "object",
+        "required": ["new_topic_name_mapping", "topic_specificities"],
+        "properties": {
+            "new_topic_name_mapping": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Mapping from numbered old labels to numbered new labels.",
+            },
+            "topic_specificities": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Specificity score for each renamed topic in order (0-1).",
+            },
+        },
+    },
+}
+
+
+def _looks_like_cluster_renaming_prompt(prompt_text: str) -> bool:
+    text = str(prompt_text or "")
+    return "new_topic_name_mapping" in text or "<topics_to_rename>" in text
+
+
+def _openai_text_format_for_prompt(prompt_text: str) -> dict:
+    schema = (
+        TOPIC_CLUSTER_NAMES_JSON_SCHEMA
+        if _looks_like_cluster_renaming_prompt(prompt_text)
+        else TOPIC_NAME_JSON_SCHEMA
+    )
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": schema["name"],
+            "strict": schema["strict"],
+            "schema": schema["schema"],
+        }
+    }
 
 
 class LLMWrapper(ABC):
@@ -2139,7 +2212,7 @@ try:
         """
         Provides access to OpenAI's LLMs with the Toponymy framework. For more information on OpenAI, see
         https://platform.openai.com/docs/models/overview. You will need an OpenAI API key to use this wrapper.
-        The default model is "gpt-4o-mini", which is a sufficiently powerful model for generating topic names and clusters,
+        The default model is "gpt-5-mini", which is a sufficiently powerful model for generating topic names and clusters,
         but inexpensive in terms of dollars per token. You can use more advanced models, but they have diminishing returns
         for this task, and are more expensive.
 
@@ -2150,7 +2223,7 @@ try:
             Your OpenAI API key. You can set this as an environment variable OPENAI_API_KEY or pass it directly
 
         model: str, optional
-            The name of the OpenAI model to use. Default is "gpt-4o-mini". You can use any model available
+            The name of the OpenAI model to use. Default is "gpt-5-mini". You can use any model available
             in the OpenAI API, but this is a good balance of performance and cost.
 
         base_url: str, optional
@@ -2185,7 +2258,7 @@ try:
         def __init__(
             self,
             api_key: str,
-            model: str = "gpt-4o-mini",
+            model: str = "gpt-5-mini",
             base_url: str = None,
             http_client: "httpx.Client | None" = None,
             llm_specific_instructions=None,
@@ -2212,16 +2285,13 @@ try:
             if self._is_gpt5_model():
                 # GPT-5 models use the new Responses API
                 # Note: temperature not supported with reasoning models
-                # The Responses API requires "json" in input when using json_object format
                 input_text = prompt + self.extra_prompting
-                if "json" not in input_text.lower():
-                    input_text += "\n\nRespond with JSON."
                 response = self.llm.responses.create(
                     model=self.model,
                     input=input_text,
                     reasoning={"effort": "minimal"},
                     max_output_tokens=max_tokens,
-                    text={"format": {"type": "json_object"}},
+                    text=_openai_text_format_for_prompt(prompt),
                 )
                 return response.output_text
             else:
@@ -2245,17 +2315,14 @@ try:
             if self._is_gpt5_model():
                 # GPT-5 models use the new Responses API with instructions parameter
                 # Note: temperature not supported with reasoning models
-                # The Responses API requires "json" in input when using json_object format
                 input_text = user_prompt + self.extra_prompting
-                if "json" not in input_text.lower():
-                    input_text += "\n\nRespond with JSON."
                 response = self.llm.responses.create(
                     model=self.model,
                     instructions=system_prompt,
                     input=input_text,
                     reasoning={"effort": "minimal"},
                     max_output_tokens=max_tokens,
-                    text={"format": {"type": "json_object"}},
+                    text=_openai_text_format_for_prompt(user_prompt),
                 )
                 return response.output_text
             else:
@@ -2276,7 +2343,7 @@ try:
         """
         Provides access to OpenAI's LLMs with asynchronous support. This allows for concurrent processing of multiple prompts.
         For more information on OpenAI, see https://platform.openai.com/docs/models/overview. You will need an OpenAI API key to use this wrapper.
-        The default model is "gpt-4o-mini", which is a sufficiently powerful model for generating topic names and clusters,
+        The default model is "gpt-5-mini", which is a sufficiently powerful model for generating topic names and clusters,
         but inexpensive in terms of dollars per token. You can use more advanced models, but they have diminishing returns for this task,
         and are more expensive.
 
@@ -2290,7 +2357,7 @@ try:
             Your OpenAI API key. You can set this as an environment variable OPENAI_API_KEY or pass it directly
 
         model: str, optional
-            The name of the OpenAI model to use. Default is "gpt-4o-mini". You can use any model available
+            The name of the OpenAI model to use. Default is "gpt-5-mini". You can use any model available
             in the OpenAI API, but this is a good balance of performance and cost.
 
         llm_specific_instructions: str, optional
@@ -2328,7 +2395,7 @@ try:
         def __init__(
             self,
             api_key: str,
-            model: str = "gpt-4o-mini",
+            model: str = "gpt-5-mini",
             llm_specific_instructions=None,
             max_concurrent_requests: int = 25,
             organization: str = None,
@@ -2363,14 +2430,12 @@ try:
                     async with self.semaphore:
                         if self._is_gpt5_model():
                             input_text = prompt + self.extra_prompting
-                            if "json" not in input_text.lower():
-                                input_text += "\n\nRespond with JSON."
                             response = await self.client.responses.create(
                                 model=self.model,
                                 input=input_text,
                                 reasoning={"effort": "minimal"},
                                 max_output_tokens=max_tokens,
-                                text={"format": {"type": "json_object"}},
+                                text=_openai_text_format_for_prompt(prompt),
                             )
                             return response.output_text
                         else:
@@ -2412,15 +2477,13 @@ try:
                     async with self.semaphore:
                         if self._is_gpt5_model():
                             input_text = user_prompt + self.extra_prompting
-                            if "json" not in input_text.lower():
-                                input_text += "\n\nRespond with JSON."
                             response = await self.client.responses.create(
                                 model=self.model,
                                 instructions=system_prompt,
                                 input=input_text,
                                 reasoning={"effort": "minimal"},
                                 max_output_tokens=max_tokens,
-                                text={"format": {"type": "json_object"}},
+                                text=_openai_text_format_for_prompt(user_prompt),
                             )
                             return response.output_text
                         else:

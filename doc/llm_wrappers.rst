@@ -118,7 +118,7 @@ The OpenAINamer wrapper provides access to OpenAI's GPT models through their API
     # Initialize with OpenAI API
     llm = OpenAINamer(
         api_key="your-openai-api-key",  # Or set OPENAI_API_KEY env var
-        model="gpt-4o-mini",  # Cost-effective model for topic naming
+        model="gpt-5-mini",  # Cost-effective model for topic naming
         llm_specific_instructions="Be precise and domain-appropriate",
         base_url="https://api.openai.com/v1"  # Optional custom endpoint
     )
@@ -283,7 +283,7 @@ Provides asynchronous access to OpenAI's GPT models with configurable concurrenc
 
     llm = AsyncOpenAINamer(
         api_key="your-openai-api-key",
-        model="gpt-4o-mini",
+        model="gpt-5-mini",
         max_concurrent_requests=8
     )
 
@@ -468,7 +468,7 @@ Topic naming is generally a simpler task than complex reasoning or code generati
 .. code-block:: python
 
     # Recommended: Cost-effective and sufficient for topic naming
-    llm = OpenAINamer(model="gpt-4o-mini")  # ~$0.15/1M input tokens
+    llm = OpenAINamer(model="gpt-5-mini")  # ~$0.15/1M input tokens
     
     # Alternative: Slightly better quality, higher cost
     llm = OpenAINamer(model="gpt-4o")       # ~$2.50/1M input tokens
@@ -594,7 +594,7 @@ The quality difference between recommended models and premium models for topic n
 
     # For production with moderate scale
     from toponymy.llm_wrappers import AsyncOpenAINamer
-    llm = AsyncOpenAINamer(api_key="...", model="gpt-4o-mini", max_concurrent_requests=5)
+    llm = AsyncOpenAINamer(api_key="...", model="gpt-5-mini", max_concurrent_requests=5)
 
     # For large-scale batch processing
     from toponymy.llm_wrappers import BatchAnthropicNamer

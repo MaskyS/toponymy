@@ -11,256 +11,352 @@ SUMMARY_KINDS = [
     "simple (1 or 2 word)",
 ]
 
-GET_TOPIC_NAME_REGEX = r'\{\s*"topic_name":\s*.*?,\s*"topic_specificity":\s*[\w.]+\s*\}'
+GET_TOPIC_NAME_REGEX = r'\{\s*"topic_name":\s*.*?,\s*"topic_specificity":\s*"?[\w.]+"?\s*\}'
 GET_TOPIC_CLUSTER_NAMES_REGEX = r'\{\s*"new_topic_name_mapping":\s*.*?,\s*"topic_specificities": .*?\}'
 
 PROMPT_TEMPLATES = {
     "layer": {
         "system": jinja2.Template(
             """
-You are an expert at classifying {{document_type}} from {{corpus_description}} into topics.
-Your task is to analyze information about a group of {{document_type}} and assign a {{summary_kind}} name to this group.
-The response must be in JSON formatted as {"topic_name":<NAME>, "topic_specificity":<SCORE>}
-where NAME is the topic name you generate and SCORE is a float value between 0.0 and 1.0,
-representing how specific and well-defined the topic name is given the input information.
-A score of 1.0 means a perfectly descriptive and specific name, while 0.0 would be a completely generic or unrelated name.
+<role>
+You label clusters of {{document_type}} for a zoomable semantic exploration interface.
+Users compare nearby labels, zoom into subtopics, and click labels to inspect grouped {{document_type}}.
+</role>
+
+<task>
+Produce one {{summary_kind}} topic label for the cluster.
+</task>
+
+<labeling_rules>
+1. Prefer the main idea, claim, subject, or recurring theme over the communication format.
+2. Use thread context when present. If several samples belong to one coherent thread, label the underlying idea, not merely "thread" or "posts".
+3. Make the label distinct from sibling topics in the same category.
+4. Only use interaction-style labels such as "replies", "conversation", "thread", or "social media discussion" when the evidence is primarily about that interaction style and no clearer semantic theme is supported.
+5. Avoid vague labels like "General discussion", "Miscellaneous thoughts", or "Social media posts".
+6. Avoid mentioning the medium itself unless it is central to the topic.
+7. Aim for roughly 4 to 12 words when possible, but prioritize semantic specificity over brevity.
 {% if is_very_specific_summary %}
-The topic name should be specific to the information given and sufficiently detailed to ensure
-it can be distinguished from other similarly detailed topics.
+8. Be especially specific and detailed.
 {% elif is_general_summary %}
-The topic name should be broad and simple enough to capture the overall sense of the
-large and diverse range of {{document_type}} contained in it at a glance.
+8. Be broad enough to summarize a diverse parent topic while still remaining informative.
 {% endif %}
 {% if has_major_subtopics %}
-You should primarily make use of the major and minor subtopics of this group to generate a name,
-and ensure the topic name reflects the core essence of *all* major subtopics.
+9. Reflect the shared core of the major subtopics, not just the loudest exemplar.
 {% endif %}
-{% if sibling_context %}
-When choosing a name, ensure it is clearly distinct from the other topics in the same category.
+</labeling_rules>
+
+{% if previous_topic_name %}
+<repair_context>
+Previous candidate label: {{previous_topic_name}}
+Problems to fix:
+{% for reason in repair_reasons %}
+- {{reason}}
+{% endfor %}
+Do not repeat the previous label if it still has these problems.
+</repair_context>
 {% endif %}
-Ensure your entire response is only the JSON object, with no other text before or after it.
+
+<mini_examples>
+Example A:
+Evidence suggests a coherent idea about building products through rapid user feedback.
+Good label: {"topic_name":"Iterating products through user feedback","topic_specificity":0.86}
+Why: semantic and browse-useful, not a generic format label.
+
+Example B:
+Evidence is mostly acknowledgements, quick banter, and low-information replies with no clear shared theme.
+Good label: {"topic_name":"Brief conversational replies","topic_specificity":0.42}
+Why: interaction-style labeling is appropriate only because semantic evidence is weak.
+</mini_examples>
+
+<output>
+Return only a JSON object with keys "topic_name" and "topic_specificity".
+"topic_specificity" must be a float between 0.0 and 1.0.
+</output>
 """
         ),
         "user": jinja2.Template(
             """
-Here is the information about the group of {{document_type}}:
+<context>
+document_type: {{document_type}}
+corpus: {{corpus_description}}
+target_specificity: {{summary_kind}}
+</context>
+
+<evidence>
 {% if cluster_keywords %}
-- Keywords for this group include: {{", ".join(cluster_keywords)}}
+<primary_keyphrases>{{", ".join(cluster_keywords)}}</primary_keyphrases>
 {% endif %}
 {%- if cluster_subtopics["major"] %}
-- Major subtopics of this group are:
+<major_subtopics>
 {%- for subtopic in cluster_subtopics["major"] %}
-  * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</major_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["minor"] %}
-- Minor subtopics of this group are:
+<minor_subtopics>
 {%- for subtopic in cluster_subtopics["minor"] %}
-  * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</minor_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["misc"] %}
-- Other miscellaneous detailed subtopics of this group in order of relevance (from most to least) include:
+<additional_subtopics>
 {%- for subtopic in cluster_subtopics["misc"] %}
-  * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</additional_subtopics>
 {%- endif %}
 {%- if sibling_context %}
-- Other topics in the same category (for contrast — your name should be distinct from these):
+<contrastive_siblings>
 {%- for sibling in sibling_context %}
-  - {{sibling}}
+- {{sibling}}
 {%- endfor %}
+</contrastive_siblings>
 {%- endif %}
 {%- if cluster_sentences %}
-- Sample {{document_type}} from this group include:
+<representative_examples>
 {%- for sentence in cluster_sentences %}
 {{exemplar_start_delimiter}}{{sentence}}{{exemplar_end_delimiter}}
 {%- endfor %}
+</representative_examples>
 {%- endif %}
+</evidence>
 
-Based on this information, provide a {{summary_kind}} name for this group.
-Recall the output format: {"topic_name":<NAME>, "topic_specificity":<SCORE>}.
+Return the best single label for this cluster as strict JSON.
 """
         ),
         "combined": jinja2.Template(
         """
-You are an expert of classifying {{document_type}} from {{corpus_description}} into topics.
-Below is a information about a group of {{document_type}} from {{corpus_description}} that 
-are all on the same topic and need to be given topic name.
+<role>
+You label clusters of {{document_type}} for a zoomable semantic exploration interface.
+</role>
 
+<task>
+Produce one {{summary_kind}} topic label for this cluster.
+</task>
+
+<labeling_rules>
+1. Prefer the main idea, claim, subject, or recurring theme over the communication format.
+2. Use thread context when present.
+3. Make the label distinct from sibling topics.
+4. Only use interaction-style labels if semantic evidence is genuinely weak.
+5. Avoid vague labels and avoid mentioning the medium unless it is central.
+6. Aim for roughly 4 to 12 words when possible, but prioritize specificity over brevity.
+{% if has_major_subtopics -%}
+7. Cover the shared core of the major subtopics.
+{%- endif %}
+</labeling_rules>
+
+{% if previous_topic_name %}
+<repair_context>
+Previous candidate label: {{previous_topic_name}}
+Problems to fix:
+{% for reason in repair_reasons %}
+- {{reason}}
+{% endfor %}
+</repair_context>
+{% endif %}
+
+<mini_examples>
+Example A:
+Evidence suggests a coherent idea about building products through rapid user feedback.
+Good label: {"topic_name":"Iterating products through user feedback","topic_specificity":0.86}
+
+Example B:
+Evidence is mostly acknowledgements and low-information replies with no clear shared theme.
+Good label: {"topic_name":"Brief conversational replies","topic_specificity":0.42}
+</mini_examples>
+
+<evidence>
 {% if cluster_keywords %}
- - Keywords for this group include: {{", ".join(cluster_keywords)}}
+<primary_keyphrases>{{", ".join(cluster_keywords)}}</primary_keyphrases>
 {% endif %}
 {%- if cluster_subtopics["major"] %}
- - Major subtopics of this group are: 
+<major_subtopics>
 {%- for subtopic in cluster_subtopics["major"] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</major_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["minor"] %}
- - Minor subtopics of this group are:
+<minor_subtopics>
 {%- for subtopic in cluster_subtopics["minor"] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</minor_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["misc"] %}
- - Other miscellaneous detailed subtopics of this group in order of relevance (from most to least) include:
+<additional_subtopics>
 {%- for subtopic in cluster_subtopics["misc"] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</additional_subtopics>
 {%- endif %}
 {%- if sibling_context %}
- - Other topics in the same category (for contrast — your name should be distinct from these):
+<contrastive_siblings>
 {%- for sibling in sibling_context %}
-      - {{sibling}}
+- {{sibling}}
 {%- endfor %}
+</contrastive_siblings>
 {%- endif %}
 {%- if cluster_sentences %}
- - Sample {{document_type}} from this group include:
+<representative_examples>
 {%- for sentence in cluster_sentences %}
 {{exemplar_start_delimiter}}{{sentence}}{{exemplar_end_delimiter}}
 {%- endfor %}
+</representative_examples>
 {%- endif %}
+</evidence>
 
-You are to give a {{summary_kind}} name to this group of {{document_type}}.
-{% if has_major_subtopics -%}
-You should primarily make use of the major and minor subtopics of this group to generate a name,
-and ensure the topic name covers *all* of the major subtopics.
-{%- endif %}
-{% if is_very_specific_summary -%}
-The topic name should be specific to the information given and sufficiently detailed to ensure 
-it can be distinguished from other similar detailed topics.
-{% elif is_general_summary -%}
-The topic name should be broad and simple enough to capture of overall sense of the 
-large and diverse range of {{document_type}} contained in it at a glance.
-{%- endif %}
-The response should be in JSON formatted as {"topic_name":<NAME>, "topic_specificity":<SCORE>} 
-where SCORE is a value in the range 0 to 1.
+<output>
+Return only JSON: {"topic_name": <NAME>, "topic_specificity": <SCORE>}
+</output>
 """
         ),
       },
     "disambiguate_topics": {
         "system": jinja2.Template(
             """
-You are an expert in {{larger_topic}}. You have been asked to provide more specific and distinguishing names for various groups of
-{{document_type}} from {{corpus_description}} that have been assigned overly similar auto-generated topic names.
+<role>
+You rename nearby topic labels for a zoomable semantic exploration interface.
+</role>
 
-Your task is to generate a new {{summary_kind}} name for each topic group presented.
-You should make use of the relative relationships between these topics, their keywords, subtopic information, and sample {{document_type}} to generate new, distinct topic names.
-The new names must be in the same order as the original topics are presented.
-There should be no duplicate topic names in your final list of new names.
+<task>
+Generate new {{summary_kind}} names for the provided topic groups so users can tell them apart quickly.
+</task>
 
-{% if is_very_specific_summary %}
-Each new topic name should be specific to the information of that topic and sufficiently detailed to ensure it can be distinguished from all the other similar topics listed.
-{% elif is_general_summary %}
-Each topic name should be broad and simple enough to capture the overall sense of the large and diverse range of {{document_type}} contained in it at a glance, while still separating it from the other topics listed.
-{% endif %}
-{% if has_major_subtopics %}
-For each topic, you should primarily make use of its major and minor subtopics to generate a name, and ensure the new topic name reflects the core essence of *all* of its major subtopics.
-{% endif %}
+<rename_rules>
+1. Make each new label semantically distinct from the others in this batch.
+2. Prefer semantic distinctions over superficial wording changes.
+3. Keep labels browse-useful: specific, concrete, and readable.
+4. Only use interaction-style labels if the evidence is mainly about interaction style.
+5. Preserve the order of topics exactly as presented.
+6. Do not output duplicate names.
+</rename_rules>
 
-The response must be formatted as a single JSON object in the format:
-{"new_topic_name_mapping": {"1. OLD_NAME1": "NEW_NAME1", "2. OLD_NAME2": "NEW_NAME2", ... }, "topic_specificities": [NEW_TOPIC_SCORE1, NEW_TOPIC_SCORE2, ...]}
-where SCORE is a float value between 0.0 and 1.0 representing the quality and specificity of the new name.
-Ensure your entire response is only the JSON object, with no other text before or after it.
+<mini_example>
+If two topics are both loosely named "AI writing", better outputs might be
+"Writing assistants for drafting" and "Evaluating LLM writing quality"
+if their evidence differs in that way.
+</mini_example>
+
+<output>
+Return only JSON in the form:
+{"new_topic_name_mapping": {"1. OLD_NAME1": "NEW_NAME1", "2. OLD_NAME2": "NEW_NAME2"}, "topic_specificities": [0.80, 0.72]}
+</output>
 """
         ),
         "user": jinja2.Template(
             """
-Below are the auto-generated topic names, along with keywords, subtopics, and sample {{document_type}} for each topic area.
+<context>
+larger_topic_context: {{larger_topic}}
+document_type: {{document_type}}
+corpus: {{corpus_description}}
+target_specificity: {{summary_kind}}
+</context>
 
-Original larger topic context: {{larger_topic}}
-Corpus description: {{corpus_description}}
-
+<topics_to_rename>
 {% for topic in topics %}
-"{{loop.index}}. {{topic}}":
+<topic index="{{loop.index}}" original_name="{{topic}}">
 {% if cluster_keywords[loop.index - 1] %}
-- Keywords for this group include: {{", ".join(cluster_keywords[loop.index - 1])}}
+<primary_keyphrases>{{", ".join(cluster_keywords[loop.index - 1])}}</primary_keyphrases>
 {% endif %}
 {%- if cluster_subtopics["major"][loop.index - 1] %}
-- Major subtopics of this group are:
+<major_subtopics>
 {%- for subtopic in cluster_subtopics["major"][loop.index - 1] %}
-    * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</major_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["minor"][loop.index - 1] %}
-- Minor subtopics of this group are:
+<minor_subtopics>
 {%- for subtopic in cluster_subtopics["minor"][loop.index - 1] %}
-    * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</minor_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["misc"][loop.index - 1] %}
-- Other miscellaneous specific subtopics of this group in order of relevance (from most to least) include:
+<additional_subtopics>
 {%- for subtopic in cluster_subtopics["misc"][loop.index - 1] %}
-    * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</additional_subtopics>
 {%- endif %}
 {%- if cluster_sentences[loop.index - 1] %}
-- Sample {{document_type}} from this group include:
+<representative_examples>
 {%- for sentence in cluster_sentences[loop.index - 1] %}
 {{exemplar_start_delimiter}}{{sentence}}{{exemplar_end_delimiter}}
 {%- endfor %}
+</representative_examples>
 {%- endif %}
+</topic>
 {% endfor %}
+</topics_to_rename>
 
-Please provide new {{summary_kind}} names for each topic, following the JSON output format specified.
+Return new names using the required JSON format.
 """
         ),
         "combined": jinja2.Template(
         """
-You are an expert in {{larger_topic}}, and have been asked to provide a more specific names for various groups of
-{{document_type}} from {{corpus_description}} that have been assigned overly similar auto-generated topic names.
+<role>
+You rename nearby topic labels for a zoomable semantic exploration interface.
+</role>
 
-Below are the auto-generated topic names, along with some keywords associated to each topic, and a sampling of {{document_type}} from the topic area.
+<task>
+Generate new {{summary_kind}} names for the provided topic groups so users can tell them apart quickly.
+</task>
 
+<rename_rules>
+1. Make each label semantically distinct from the others in this batch.
+2. Prefer semantic distinctions over superficial wording changes.
+3. Keep labels browse-useful and concrete.
+4. Do not output duplicate names.
+5. Preserve the order and the numbered keys exactly.
+</rename_rules>
+
+<topics_to_rename>
 {% for topic in topics %}
-
-"{{loop.index}}. {{topic}}":
+<topic index="{{loop.index}}" original_name="{{topic}}">
 {% if cluster_keywords[loop.index - 1] %}
- - Keywords for this group include: {{", ".join(cluster_keywords[loop.index - 1])}}
+<primary_keyphrases>{{", ".join(cluster_keywords[loop.index - 1])}}</primary_keyphrases>
 {% endif %}
 {%- if cluster_subtopics["major"][loop.index - 1] %}
- - Major subtopics of this group are: 
+<major_subtopics>
 {%- for subtopic in cluster_subtopics["major"][loop.index - 1] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</major_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["minor"][loop.index - 1] %}
- - Minor subtopics of this group are:
+<minor_subtopics>
 {%- for subtopic in cluster_subtopics["minor"][loop.index - 1] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</minor_subtopics>
 {%- endif %}
 {%- if cluster_subtopics["misc"][loop.index - 1] %}
- - Other miscellaneous specific subtopics of this group in order of relevance (from most to least) include:
+<additional_subtopics>
 {%- for subtopic in cluster_subtopics["misc"][loop.index - 1] %}
-      * {{subtopic}}
+- {{subtopic}}
 {%- endfor %}
+</additional_subtopics>
 {%- endif %}
 {%- if cluster_sentences[loop.index - 1] %}
- - Sample {{document_type}} from this group include:
+<representative_examples>
 {%- for sentence in cluster_sentences[loop.index - 1] %}
 {{exemplar_start_delimiter}}{{sentence}}{{exemplar_end_delimiter}}
 {%- endfor %}
+</representative_examples>
 {%- endif %}
+</topic>
 {% endfor %}
+</topics_to_rename>
 
-You are to give a new {{summary_kind}} name to each topic.
-You should make use of the relative relationships between these topics as well as the keywords and {{self.document_type}} information and your expertise in {{larger_topic}} to generate new better and more distinguishing topic names. 
-{% if cluster_subtopics["major"] -%}
-You should primarily make use of the major and minor subtopics of each topic to generate a name, and ensure the new topic name covers *all* of the major subtopics.
-{%- endif %}
-{% if "very specific" in summary_kind -%}
-Each new topic name should be specific to the information of that topic and sufficiently detailed to ensure  it can be distinguished from all the other similar topics listed.
-{% elif "general" in summary_kind -%}
-Each topic name should be broad and simple enough to capture of overall sense of the large and diverse range of {{document_type}} contained in it at a glance, while still separating it from the other topics listed.
-{%- endif %}
-The new names must be in the same order as presented above. There should be no duplicate topic names in the final list. The primary goal is to make each new topic name clearly distinguishable from the others in this list, based on the provided details.
-
-The response should be formatted as JSON in the format 
-    {"new_topic_name_mapping": {<1. OLD_NAME1>: <NEW_NAME1>, <2. OLD_NAME2>: <NEW_NAME2>, ... }, topic_specificities": [<NEW_TOPIC_SCORE1>, <NEW_TOPIC_SCORE2>, ...]}
-where SCORE is a value in the range 0 to 1.
-The response must contain only JSON with no preamble and must have one entry for each topic to be renamed.
+<output>
+Return only JSON:
+{"new_topic_name_mapping": {"1. OLD_NAME1": "NEW_NAME1", "2. OLD_NAME2": "NEW_NAME2"}, "topic_specificities": [0.80, 0.72]}
+</output>
 """
       ),
     },

@@ -1,4 +1,5 @@
 from toponymy.cluster_layer import ClusterLayerText, ClusterLayer
+from toponymy.llm_wrappers import LLMWrapper
 from toponymy.keyphrases import KeyphraseBuilder
 from toponymy.clustering import centroids_from_labels, ToponymyClusterer
 
@@ -214,3 +215,74 @@ def test_make_data_alternative_methods2(
         "about specific popular topics",
         cluster_tree,
     )
+
+
+def test_build_sibling_context_orders_by_centroid_similarity():
+    cluster_labels = np.array([0, 0, 1, 1, 2, 2])
+    centroid_vectors = np.array(
+        [
+            [0.0, 0.0],
+            [0.2, 0.0],
+            [3.0, 0.0],
+        ]
+    )
+    cluster_layer = ClusterLayerText(
+        cluster_labels,
+        centroid_vectors,
+        0,
+    )
+    cluster_layer.keyphrases = [
+        ["origin"],
+        ["nearby"],
+        ["far"],
+    ]
+    all_topic_names = [["Current Topic", "Nearby Topic", "Far Topic"]]
+    cluster_tree = {
+        (1, 0): [(0, 0), (0, 2), (0, 1)],
+    }
+
+    sibling_context = cluster_layer._build_sibling_context(
+        topic_index=0,
+        all_topic_names=all_topic_names,
+        cluster_tree=cluster_tree,
+    )
+
+    assert sibling_context == [
+        "Nearby Topic (keyphrases: nearby)",
+        "Far Topic (keyphrases: far)",
+    ]
+
+
+class _SpecificityTestLLM(LLMWrapper):
+    def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        raise NotImplementedError
+
+    def _call_llm_with_system_prompt(
+        self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int
+    ) -> str:
+        raise NotImplementedError
+
+    def generate_topic_name_with_specificity(self, prompt, temperature: float = 0.4):
+        return ("Specific topic label", 0.81)
+
+
+def test_name_topics_stores_first_pass_specificity():
+    cluster_labels = np.array([0, 0, 1, 1])
+    centroid_vectors = np.array([[0.0, 0.0], [1.0, 1.0]])
+    cluster_layer = ClusterLayerText(cluster_labels, centroid_vectors, 0)
+    cluster_layer.prompts = ["prompt-a", "prompt-b"]
+    cluster_layer.disambiguate_topics = lambda *args, **kwargs: None
+    all_topic_names = [[], []]
+
+    names = cluster_layer.name_topics(
+        llm=_SpecificityTestLLM(),
+        detail_level=0.5,
+        all_topic_names=all_topic_names,
+        object_description="tweets",
+        corpus_description="tweet corpus",
+        cluster_tree=None,
+        embedding_model=None,
+    )
+
+    assert names == ["Specific topic label", "Specific topic label"]
+    assert cluster_layer.topic_specificities == {0: 0.81, 1: 0.81}

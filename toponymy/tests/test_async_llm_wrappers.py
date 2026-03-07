@@ -54,11 +54,12 @@ class MockAsyncResponse:
         class Choice:
             def __init__(self, content):
                 self.message = Mock(content=content)
-        
+
         class Response:
             def __init__(self, content):
                 self.choices = [Choice(content)]
-        
+                self.output_text = content
+
         return Response(content)
     
     @staticmethod
@@ -334,7 +335,7 @@ async def async_openai_wrapper():
 @pytest.mark.asyncio
 async def test_async_openai_generate_topic_names_success(async_openai_wrapper, mock_data):
     response = MockAsyncResponse.create_openai_response(mock_data["valid_topic_name"])
-    async_openai_wrapper.client.chat.completions.create = AsyncMock(return_value=response)
+    async_openai_wrapper.client.responses.create = AsyncMock(return_value=response)
     
     result = await async_openai_wrapper.generate_topic_names(["test prompt"])
     assert len(result) == 1
@@ -344,7 +345,7 @@ async def test_async_openai_generate_topic_names_success(async_openai_wrapper, m
 @pytest.mark.asyncio
 async def test_async_openai_generate_topic_names_system_prompt(async_openai_wrapper, mock_data):
     response = MockAsyncResponse.create_openai_response(mock_data["valid_topic_name"])
-    async_openai_wrapper.client.chat.completions.create = AsyncMock(return_value=response)
+    async_openai_wrapper.client.responses.create = AsyncMock(return_value=response)
     
     result = await async_openai_wrapper.generate_topic_names([{"system": "system prompt", "user": "test prompt"}])
     assert len(result) == 1
@@ -354,7 +355,7 @@ async def test_async_openai_generate_topic_names_system_prompt(async_openai_wrap
 @pytest.mark.asyncio
 async def test_async_openai_generate_topic_cluster_names_success(async_openai_wrapper, mock_data):
     response = MockAsyncResponse.create_openai_response(mock_data["valid_cluster_names"])
-    async_openai_wrapper.client.chat.completions.create = AsyncMock(return_value=response)
+    async_openai_wrapper.client.responses.create = AsyncMock(return_value=response)
     
     result = await async_openai_wrapper.generate_topic_cluster_names(
         ["test prompt"], [mock_data["old_names"]]
@@ -366,7 +367,7 @@ async def test_async_openai_generate_topic_cluster_names_success(async_openai_wr
 @pytest.mark.asyncio
 async def test_async_openai_generate_topic_cluster_names_system_prompt(async_openai_wrapper, mock_data):
     response = MockAsyncResponse.create_openai_response(mock_data["valid_cluster_names"])
-    async_openai_wrapper.client.chat.completions.create = AsyncMock(return_value=response)
+    async_openai_wrapper.client.responses.create = AsyncMock(return_value=response)
     
     result = await async_openai_wrapper.generate_topic_cluster_names(
         [{"system": "system prompt", "user": "test prompt"}], 
@@ -379,7 +380,7 @@ async def test_async_openai_generate_topic_cluster_names_system_prompt(async_ope
 @pytest.mark.asyncio
 async def test_async_openai_generate_topic_cluster_names_malformed_mapping(async_openai_wrapper, mock_data):
     response = MockAsyncResponse.create_openai_response(mock_data["malformed_mapping"])
-    async_openai_wrapper.client.chat.completions.create = AsyncMock(return_value=response)
+    async_openai_wrapper.client.responses.create = AsyncMock(return_value=response)
     
     result = await async_openai_wrapper.generate_topic_cluster_names(
         ["test prompt"], [mock_data["old_names"]]

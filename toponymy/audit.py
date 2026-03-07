@@ -470,7 +470,7 @@ def flag_clusters_for_relabel(
     toponymy_instance,
     duplicate_threshold: float = 0.0,
     specificity_threshold: float = 0.3,
-    keyphrase_alignment_threshold: float = 0.0,
+    keyphrase_alignment_threshold: float = 0.2,
 ) -> List[Tuple[int, int, List[str]]]:
     """
     Flag clusters whose labels should be regenerated.
@@ -536,6 +536,33 @@ def flag_clusters_for_relabel(
     return flagged
 
 
+def _format_repair_reasons(reasons: List[str]) -> List[str]:
+    formatted = []
+    for reason in reasons:
+        if reason.startswith("duplicate_name:"):
+            duplicate_name = reason.split(":", 1)[1]
+            formatted.append(
+                f'The previous label duplicated another topic name in the same layer ("{duplicate_name}").'
+            )
+        elif reason.startswith("low_specificity:"):
+            score = reason.split(":", 1)[1]
+            formatted.append(
+                f"The previous label was too generic for the evidence (specificity {score})."
+            )
+        elif reason == "no_keyphrase_alignment":
+            formatted.append(
+                "The previous label did not reflect the strongest keyphrases for the cluster."
+            )
+        elif reason.startswith("low_keyphrase_alignment:"):
+            score = reason.split(":", 1)[1]
+            formatted.append(
+                f"The previous label only weakly matched the top keyphrases (alignment {score})."
+            )
+        else:
+            formatted.append(reason.replace("_", " "))
+    return formatted
+
+
 def run_relabel_pass(
     toponymy_instance,
     flagged_clusters: List[Tuple[int, int, List[str]]],
@@ -573,9 +600,29 @@ def run_relabel_pass(
         prompt_entries = []
         for layer_idx, cluster_idx, reasons in flagged_clusters:
             layer = toponymy_instance.cluster_layers_[layer_idx]
-            if not hasattr(layer, "prompts") or cluster_idx >= len(layer.prompts):
-                continue
-            prompt_entries.append((layer_idx, cluster_idx, layer, layer.prompts[cluster_idx]))
+            repair_prompt = None
+            if (
+                hasattr(layer, "build_topic_prompt")
+                and getattr(layer, "detail_level", None) is not None
+            ):
+                try:
+                    repair_prompt = layer.build_topic_prompt(
+                        topic_index=cluster_idx,
+                        detail_level=layer.detail_level,
+                        all_topic_names=toponymy_instance.topic_names_,
+                        object_description=toponymy_instance.object_description,
+                        corpus_description=toponymy_instance.corpus_description,
+                        cluster_tree=getattr(toponymy_instance, "cluster_tree_", None),
+                        previous_topic_name=layer.topic_names[cluster_idx],
+                        repair_reasons=_format_repair_reasons(reasons),
+                    )
+                except Exception:
+                    repair_prompt = None
+            if repair_prompt is None:
+                if not hasattr(layer, "prompts") or cluster_idx >= len(layer.prompts):
+                    continue
+                repair_prompt = layer.prompts[cluster_idx]
+            prompt_entries.append((layer_idx, cluster_idx, layer, repair_prompt))
             attempted_clusters.add((layer_idx, cluster_idx))
 
         if not prompt_entries:
